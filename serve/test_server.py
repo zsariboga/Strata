@@ -3228,6 +3228,18 @@ class ThinkingBudget(unittest.TestCase):
         msg = b["choices"][0]["message"]
         self.assertEqual((msg["content"], b["choices"][0]["finish_reason"]), ("The ", "stop"))
 
+    def test_hidden_wrap_up_reaches_the_model_not_the_client(self):
+        from serve.server import REASONING_WRAP_UP
+        self.svc.hide_reasoning_wrap_up = True
+        code, b = self.openai(reasoning_budget_tokens=20)
+        self.assertEqual(code, 200, b)
+        msg = b["choices"][0]["message"]
+        self.assertEqual(msg["reasoning_content"], ThinkingEngine.THOUGHT[:20])
+        self.assertEqual(msg["content"], ThinkingEngine.ANSWER)
+        first, second = self.engine.prompts
+        extra = self.tok.encode(REASONING_WRAP_UP, parse_special=True)
+        self.assertEqual(second, first + self.tok.encode(ThinkingEngine.THOUGHT[:20]) + extra)
+
     def test_anthropic_stream(self):
         from serve.server import REASONING_WRAP_UP
         code, raw = self.post("/v1/messages", {"model": "m", "max_tokens": 400, "stream": True,
@@ -3271,6 +3283,21 @@ class ThinkingBudget(unittest.TestCase):
             with self.assertRaises(ValueError, msg=repr(bad)):
                 self.svc.set_shared({"reasoning_budget_tokens": bad})
         self.assertEqual(self.svc.set_shared({"reasoning_budget_tokens": 0}), {"reasoning_budget_tokens": 0})
+
+    def test_the_budget_follows_the_effort(self):
+        # yerel yama: reasoning_budget_by_effort - the request's effort picks the budget; an explicit budget still wins
+        self.svc.reasoning_budget_tokens = 10_000
+        self.svc.reasoning_budget_by_effort = {"low": 20, "medium": 10_000}
+        code, b = self.openai(reasoning_effort="low")
+        self.assertEqual(code, 200, b)
+        self.assertTrue(b["choices"][0]["message"]["reasoning_content"].startswith(ThinkingEngine.THOUGHT[:20] + "\n"))
+        self.assertEqual(len(self.engine.prompts), 2)
+        code, b = self.openai(reasoning_effort="medium")
+        self.assertEqual(b["choices"][0]["message"]["reasoning_content"], ThinkingEngine.THOUGHT)
+        code, b = self.openai(reasoning_effort="low", reasoning_budget_tokens=10_000)
+        self.assertEqual(b["choices"][0]["message"]["reasoning_content"], ThinkingEngine.THOUGHT)
+        self.assertIsNone(self.svc.effort_budget({"reasoning_effort": "xhigh"}))     # not in the table: config's
+        self.assertEqual(self.svc.effort_budget({"chat_template_kwargs": {"reasoning_effort": "LOW"}}), 20)
 
     def test_without_thinking_there_is_nothing_to_limit(self):
         self.engine.THOUGHT = ""
@@ -3415,7 +3442,8 @@ class ForcedToolChoice(unittest.TestCase):
                     self.assertTrue(self.tok.decode(self.engine.prompts[0]).endswith("</think>\n\n" + opening))
 
     def test_the_budget_wrap_up_opens_the_call(self):
-        from serve.server import REASONING_WRAP_UP
+        # local: with tools the wrap-up is REASONING_WRAP_UP_TOOLS ("act on the plan ... first tool call")
+        from serve.server import REASONING_WRAP_UP_TOOLS as REASONING_WRAP_UP
         code, b = self.openai(tool_choice="required", reasoning_budget_tokens=20)
         finish, calls, reasoning = self.call_of(code, b, False)
         self.assertEqual((finish, calls), ("tool_calls", [("search", {"q": "2+2"})]))
@@ -4707,6 +4735,47 @@ class ClaudeCodeBillingStamp(unittest.TestCase):
         first = svc.encode_prompt(*anthropic_to_messages({"system": self.blocks(c="b145e"), "messages": turn1,
                                                          "tools": tools}))
         self.assertEqual(ids[1][:len(first) - 8], first[:len(first) - 8])   # all but the generation header
+
+class EmptyAssistantTurns(unittest.TestCase):
+    """#843: empty assistant turns (no text, no tool calls) are left out of the prompt; the model imitated them and
+    stopped calling tools.  The last message stays, and STRATA_KEEP_EMPTY_TURNS=1 keeps the old behaviour."""
+
+    TPL = ChatTemplate(ROOT / "serve/chat_template.jinja")
+    CHAT = [{"role": "user", "content": "haz un ls"},
+            {"role": "assistant", "content": "", "reasoning_content": "The user wants ls."},
+            {"role": "user", "content": "haz un ls"},
+            {"role": "assistant", "content": [{"type": "text", "text": "  "}]},
+            {"role": "user", "content": "haz un ls"},
+            {"role": "assistant", "content": None, "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "bash", "arguments": {"command": "ls"}}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "a.txt"},
+            {"role": "assistant", "content": "a.txt"},
+            {"role": "user", "content": "haz un ls"}]
+
+    def render(self, messages):
+        return self.TPL.render(messages, add_generation_prompt=True)
+
+    def setUp(self):
+        patch = mock.patch.dict(os.environ)
+        patch.start()
+        self.addCleanup(patch.stop)
+        os.environ.pop("STRATA_KEEP_EMPTY_TURNS", None)
+
+    def test_empty_turns_are_skipped(self):
+        kept = [m for i, m in enumerate(self.CHAT) if i not in (1, 3)]
+        self.assertEqual(self.render(self.CHAT), self.render(kept))
+        self.assertNotIn("The user wants ls.", self.render(self.CHAT))
+        self.assertIn("<tool_call>", self.render(self.CHAT))                # a turn with only a tool call stays
+        self.assertIn("a.txt", self.render(self.CHAT))
+
+    def test_the_last_message_stays(self):
+        chat = self.CHAT[:2]                                                 # ends with an empty assistant turn
+        self.assertNotEqual(self.render(chat), self.render(chat[:1]))
+
+    def test_opt_out(self):
+        os.environ["STRATA_KEEP_EMPTY_TURNS"] = "1"
+        kept = [m for i, m in enumerate(self.CHAT) if i not in (1, 3)]
+        self.assertNotEqual(self.render(self.CHAT), self.render(kept))
 
 
 class UntimedReads(unittest.TestCase):

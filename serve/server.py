@@ -195,6 +195,11 @@ def focused_recovery_prompt(tok, ids, generated):
     return None
 
 
+
+# local: with tools in the request "give my answer" made agents reply with a plan and end the turn without a tool
+# call (opencode asm task, 2026-10-03); this wording steers the model to act on the plan instead
+REASONING_WRAP_UP_TOOLS = ("\n\nI have thought about this long enough; time to act on the plan now, starting with the "
+                           "first tool call.\n</think>\n\n")
 LOOPBACK_NAMES = ("localhost", "127.0.0.1", "::1")
 CTX_SLACK = 8               # `strata --serve` rejects prompt + max_new + 8 > context: keep the same margin here
 # The live tok/s is a rate over a window, not a mean since the first token: a mean reads ~1/elapsed at the first
@@ -2444,6 +2449,8 @@ class Service:
         self.vram_reserve = None                         # #533: the last POST /v1/vram reserve (None: the start's)
         self.reasoning_loop_recovery = False
         self.reasoning_budget_tokens = 0                 # #123: the config's default thinking budget (0: none)
+        self.reasoning_budget_by_effort = {}             # yerel yama: efor -> dusunme butcesi (config)
+        self.hide_reasoning_wrap_up = False              # local: keep the budget's wrap-up sentence out of replies
         self.repeat_stop_tokens = REPEAT_STOP_TOKENS     # #606: one token this many times in a row ends a reply (0: off)
         self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
         self.tool_call_recovery = False                   # opt-in: tool calls in forms next to the template's
@@ -2553,12 +2560,28 @@ class Service:
         anything that is not a whole number."""
         value = (req or {}).get("reasoning_budget_tokens") if isinstance(req, dict) else None
         if value is None:
+            value = self.effort_budget(req)          # yerel yama: eforun butcesi (config reasoning_budget_by_effort)
+        if value is None:
             value = self.reasoning_budget_tokens
         if isinstance(value, float) and value.is_integer():
             value = int(value)
         if isinstance(value, bool) or not isinstance(value, int):
             raise ValueError(f"reasoning_budget_tokens={value!r}: expected a whole number of tokens (0: no budget)")
         return value if value > 0 else None
+
+    def effort_budget(self, req) -> int | None:
+        """Yerel yama: istegin eforu (reasoning_effort, reasoning.effort ya da chat_template_kwargs.reasoning_effort)
+        config'teki reasoning_budget_by_effort tablosunda varsa onun butcesi, yoksa None (config'in tek butcesi gecer).
+        Swift xhigh ortalama ~7.8K token dusunur; tek 4096'lik butce xhigh'i yarida keser."""
+        table = getattr(self, "reasoning_budget_by_effort", None) or {}
+        if not table or not isinstance(req, dict):
+            return None
+        ctk = req.get("chat_template_kwargs") if isinstance(req.get("chat_template_kwargs"), dict) else {}
+        reasoning = req.get("reasoning") if isinstance(req.get("reasoning"), dict) else {}
+        effort = req.get("reasoning_effort") or reasoning.get("effort") or ctk.get("reasoning_effort")
+        if not isinstance(effort, str):
+            return None
+        return table.get(effort.strip().lower())
 
     def _vision_down(self) -> bool:
         return self.vision is not None and hasattr(self.vision, "alive") and not self.vision.alive()
@@ -3416,9 +3439,12 @@ class Service:
                         # was generated plus the wrap-up, so the engine continues from the prefix it already holds.
                         # A forced call (tool_choice) is opened the same way: after the wrap-up, or where the
                         # thinking ended, after the blank line the template puts before a call.
+                        # local: with tools the wrap-up steers the model to its first tool call (REASONING_WRAP_UP_TOOLS)
+                        wrap_up = ""
                         if wrap:
                             budget = None
-                            text = REASONING_WRAP_UP + (force or "")
+                            wrap_up = REASONING_WRAP_UP_TOOLS if tools else REASONING_WRAP_UP
+                            text = wrap_up + (force or "")
                         else:
                             text = "\n" * (2 - (len(tail) - len(tail.rstrip("\n")))) + force
                         force = None
@@ -3428,11 +3454,18 @@ class Service:
                         if wrap:
                             print(f"[strata] thinking budget reached ({thought} tokens): wrapping up the thinking",
                                   flush=True)
-                        for t in extra:
+                        # local: with hide_reasoning_wrap_up the wrap-up sentence goes to the model but not to the
+                        # client, so agent clients that send the thinking back do not teach the model to repeat it
+                        hidden = len(self.tok.encode(wrap_up.split("</think>")[0], parse_special=True)) \
+                            if wrap and self.hide_reasoning_wrap_up else 0
+                        for i, t in enumerate(extra):
                             n += 1
                             raw_ids.append(t)
                             thinking_n += parser.state in ("reasoning", "rcall")
-                            evs = cut(parser.feed(detok.push(t)))
+                            piece = detok.push(t)
+                            if i < hidden:
+                                continue
+                            evs = cut(parser.feed(piece))
                             self._note(n, evs, st, rate)
                             for ev in evs:
                                 yield "event", ev
@@ -5535,6 +5568,16 @@ def main() -> int:
         raise SystemExit("[strata] config \"reasoning_loop_recovery\" must be false, \"stop\" or \"recover\", "
                          f"not {recovery!r}")
     svc.reasoning_loop_recovery = recovery
+
+    by_effort = cfg.get("reasoning_budget_by_effort")    # yerel yama: {"low": 4096, "medium": 8192, "xhigh": 16384}
+    if by_effort is not None:
+        if not isinstance(by_effort, dict) or not all(
+                isinstance(k, str) and isinstance(v, int) and not isinstance(v, bool) for k, v in by_effort.items()):
+            raise SystemExit("[strata] config reasoning_budget_by_effort: expected {\"low\": 4096, ...} (whole numbers)")
+        svc.reasoning_budget_by_effort = {k.strip().lower(): v for k, v in by_effort.items()}
+        print("[strata] thinking budget by effort: " + ", ".join(f"{k} {v}" for k, v in svc.reasoning_budget_by_effort.items()),
+              flush=True)
+    svc.hide_reasoning_wrap_up = bool(cfg.get("hide_reasoning_wrap_up", False))
     svc.gpu_index = (gpu_list(cfg) or [0])[0]           # the Monitor reads the card the engine runs on (issue #51)
     svc.gpu_indices = gpu_list(cfg)                     # ... or every card of a layer split (issue #112)
     svc.backend = cfg.get("backend")                    # "hip": the AMD cards' readings come from sysfs (#301)
