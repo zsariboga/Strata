@@ -275,6 +275,11 @@ private:
     // batch windows (see init_slots)
     std::vector<SessionState*> slots_;
     bool batch_rec_ = false;               ///< record_window is capturing a batch window
+    bool typ_open_ = true;                 ///< STRATA_TYPICAL_THINK/_ANSWER: the reply is where lossy rows may run
+public:
+    /// STRATA_TYPICAL_THINK=1: the serve loop says whether the reply is still thinking (lossy acceptance only then).
+    void set_typical_open(bool open) { typ_open_ = open; }
+private:
     int row_base_ = 0;                     ///< ... its hand-off rows start here (a pipeline group's own rows)
     int brow_[8] = {};                     ///< ... and row t is slot brow_[t]
     bool last_batch_ = false;              ///< the last run was a batch window (set_plan_slot: one group)

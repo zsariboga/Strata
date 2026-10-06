@@ -2032,9 +2032,55 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     if (head_sampling_ && (sampled || hist_d_ != nullptr)) {
         SamplerParams sp = sampling_;
         sp.counter = (uint64_t) pos0;
+        // STRATA_TYPICAL="eps,delta" (opt-in, LOSSY): row t keeps the draft tokens[t + 1] when it is typical under the
+        // row's final distribution (sampler.hpp).  Unset: the exact match against the row's own draw, as before.
+        // STRATA_TYPICAL="eps,delta" (typical) or STRATA_TYPICAL_MARGIN="r" (margin; wins when both are set);
+        // STRATA_TYPICAL_THINK=1: only while the reply is inside <think> (the serve loop tracks it).
+        // STRATA_TYPICAL_ANSWER=1: also in the answer's plain text, strict inside <tool_call> and ``` code (the serve
+        // loop tracks it).  With either switch, a structure mark in the window ends the lossy rows (below).
+        struct TypCfg { int mode = 0; float a = 0.0f, b = 0.0f; bool think = false, answer = false; };
+        static const TypCfg typ = [] {
+            TypCfg c;
+            float a = 0.0f, b = 0.0f;
+            const char* m = std::getenv("STRATA_TYPICAL_MARGIN");
+            const char* e = std::getenv("STRATA_TYPICAL");
+            if (m != nullptr && std::sscanf(m, "%f", &a) == 1 && a > 0.0f && a <= 1.0f) { c.mode = 2; c.a = a; }
+            else if (e != nullptr && std::sscanf(e, "%f,%f", &a, &b) == 2 && a > 0.0f && b > 0.0f) {
+                c.mode = 1; c.a = a; c.b = b;
+            }
+            const char* t = std::getenv("STRATA_TYPICAL_THINK");
+            c.think = t != nullptr && t[0] == '1';
+            const char* an = std::getenv("STRATA_TYPICAL_ANSWER");
+            c.answer = an != nullptr && an[0] == '1';
+            if (c.mode == 1)
+                std::fprintf(stderr, "strata verify: STRATA_TYPICAL on (lossy, typical): eps %.3f, delta %.3f%s\n", c.a,
+                             c.b, c.answer ? ", strict in tool calls and code" : c.think ? ", thinking only" : "");
+            else if (c.mode == 2)
+                std::fprintf(stderr, "strata verify: STRATA_TYPICAL on (lossy, margin): ratio %.3f%s\n", c.a,
+                             c.answer ? ", strict in tool calls and code" : c.think ? ", thinking only" : "");
+            return c;
+        }();
+        const bool switched = typ.think || typ.answer;
+        if (typ.mode != 0 && tokens != nullptr && (!switched || typ_open_)) {
+            sp.typ_mode = typ.mode;
+            sp.typ_eps = typ.a;
+            sp.typ_delta = typ.b;
+            // a structure mark (Qwen 3.8 ids: <think> 248068, </think> 248069, <tool_call> 248058, </tool_call> 248059,
+            // <|im_end|> 248046, ``` 71093 / 52451) is never kept by the lossy rule, and the rows after it read a
+            // state the serve loop has not seen yet: strict from the mark on
+            auto mark = [](int32_t id) {
+                return id == 248068 || id == 248069 || id == 248058 || id == 248059 || id == 248046 || id == 71093 ||
+                       id == 52451;
+            };
+            for (int t = 0; t + 1 < T && t < 8; ++t) {
+                if (switched && mark(tokens[t + 1])) break;
+                sp.typ_draft[t] = tokens[t + 1];
+            }
+        }
         // STRATA_SPEC_PROB: the drafter's q lists for this window, judged by rejection sampling (spec_prob.hpp)
         bool judged = false;
-        if (sampled && spec_q_ != nullptr && spec_nq_ > 0 && T > 1 && T <= kVerifyMaxT) {
+        // the lossy rows above judge the drafts their own way: STRATA_SPEC_PROB only while they are off
+        if (sampled && sp.typ_mode == 0 && spec_q_ != nullptr && spec_nq_ > 0 && T > 1 && T <= kVerifyMaxT) {
             if (d_spec_ == nullptr &&
                 cudaMalloc((void**) &d_spec_, (size_t) kVerifyMaxT * (1 + strata::core::kSpecQStride) * sizeof(int32_t)) !=
                     cudaSuccess) {

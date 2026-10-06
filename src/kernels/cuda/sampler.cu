@@ -546,6 +546,23 @@ __device__ void sampled_tail_warp(const int* sel_ids, const float* sel_logit, in
                 if ((double) u < cum) { pick = sel_ids[i]; pi = i; break; }
             }
         }
+        if constexpr (!kProb) {
+            // STRATA_TYPICAL: keep the draft when it is typical under this final distribution (lossy, opt-in)
+            if (p.typ_mode != 0 && t < 8 && p.typ_draft[t] >= 0 && p.typ_draft[t] != pick) {
+                const int d = p.typ_draft[t];
+                double h = 0.0, pd = 0.0, ptop = 0.0;
+                for (int i = 0; i < n_keep; ++i) {
+                    const double e = ex[i];
+                    if (e > 0.0) h -= e * log(e);
+                    if (e > ptop) ptop = e;
+                    if (sel_ids[i] == d) pd = e;
+                }
+                bool keep = false;
+                if (p.typ_mode == 1) keep = pd > fmin((double) p.typ_eps, (double) p.typ_delta * exp(-h));
+                else if (p.typ_mode == 2) keep = pd > 0.0 && pd >= (double) p.typ_eps * ptop;
+                if (keep) pick = d;
+            }
+        }
         out[t] = pick;
         if constexpr (kProb) *prob_out = n_keep > 0 ? (float) ex[pi] : 1.0f;
     }

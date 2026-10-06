@@ -26,6 +26,16 @@ struct SamplerParams {
     uint64_t counter = 0;        // absolute draw index of row 0; advance across decode calls
     bool greedy = false;
     bool gumbel = false;         // STRATA_SPEC_GUMBEL=1: Gumbel-max pick keyed by (seed, counter, token id) - see sampler.cu
+    // STRATA_TYPICAL (opt-in, LOSSY; Medusa's typical acceptance): a verify row keeps the window's draft instead of
+    // its own draw when the draft's probability under the final distribution exceeds min(typ_eps, typ_delta * exp(-H)),
+    // H that distribution's entropy.  typ_eps 0 = off (the exact match, as before).  typ_draft[t]: the draft row t
+    // verifies (-1 none); set by Verifier::run only, so the drafter's own sampling never sees it.
+    // typ_mode 1: typical (keep when p > min(typ_eps, typ_delta * exp(-H)));  2: margin (keep when p >= typ_eps * p_top1,
+    // "Margins, Not Windows", arXiv 2609.02897).  0 = off.
+    int32_t typ_mode = 0;
+    float typ_eps = 0.0f;
+    float typ_delta = 0.0f;
+    int32_t typ_draft[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
 };
 
 // logits (n_tokens, n_vocab) -> one sampled token id per row in `out`.

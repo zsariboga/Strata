@@ -9798,6 +9798,31 @@ int main(int argc, char** argv) {
             std::vector<int32_t> consumed;
             consumed.reserve((size_t) (n + max_new + S));
             for (int64_t i = 0; i < n - 1; ++i) consumed.push_back((int32_t) ids[(size_t) i]);
+            // STRATA_TYPICAL_THINK / _ANSWER: where is the reply?  The prompt's last turn (from its <|im_start|>,
+            // 248045) is read forward: <think> 248068 / </think> 248069, <tool_call> 248058 / </tool_call> 248059,
+            // ``` 71093 / 52451 (outside a tool call; a think edge closes an open fence).  Qwen 3.8 ids.
+            static const bool typ_answer = [] {
+                const char* a = std::getenv("STRATA_TYPICAL_ANSWER");
+                return a != nullptr && a[0] == '1';
+            }();
+            struct TypState {
+                bool think = false, tool = false, fence = false;
+                void feed(int64_t id) {
+                    if (id == 248068) { think = true; fence = false; }
+                    else if (id == 248069) { think = false; fence = false; }
+                    else if (id == 248058) tool = true;
+                    else if (id == 248059) tool = false;
+                    else if ((id == 71093 || id == 52451) && !tool) fence = !fence;
+                }
+                bool lossy(bool answer) const { return answer ? !tool && !fence : think; }
+            } typ_st;
+            {
+                int64_t s = 0;
+                for (int64_t i = n - 1; i >= 0; --i)
+                    if (ids[(size_t) i] == 248045) { s = i; break; }
+                for (int64_t i = s; i < n; ++i) typ_st.feed(ids[(size_t) i]);
+                ver.set_typical_open(typ_st.lossy(typ_answer));
+            }
             const char* finish = "length";
             const Clock::time_point d0 = Clock::now();
             // STRATA_DECODE_TIMING=1: where a request's decode time goes (one line per request)
@@ -10550,6 +10575,8 @@ int main(int argc, char** argv) {
                     ++produced_n;
                     if (sfx_on) sfx.append(outv[(size_t) i]);
                     if (o.lookup_chain > 0) extra_sources_append(&outv[(size_t) i], 1);
+                    typ_st.feed(outv[(size_t) i]);
+                    ver.set_typical_open(typ_st.lossy(typ_answer));
                     eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outv[(size_t) i]) != o.eos_ids.end();
                 }
                 std::fflush(stdout);
