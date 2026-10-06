@@ -4042,6 +4042,19 @@ void car_apply(void* user, int32_t* ids, const float* weights, const float* scor
 
     if (!(d.car_cfg.threshold < 1.0f)) return;   // off
     if (!d.car_open) return;                     // local: outside the window's allowed structure (STRATA_CAR_SCOPE)
+    // local: STRATA_CAR_LAYERS="lo-hi" (inclusive) - only these layers substitute.  The first and last layers (where
+    // the language-specific experts sit, and where the next token - "</think> or a tool call?" - is decided) stay
+    // exact.  Unset = every layer (the PR's rule).
+    static const std::pair<int64_t, int64_t> car_layers = [] {
+        long long lo = 0, hi = INT64_MAX;
+        if (const char* v = std::getenv("STRATA_CAR_LAYERS"); v != nullptr && *v != '\0') {
+            long long a = 0, b = 0;
+            if (std::sscanf(v, "%lld-%lld", &a, &b) == 2 && a <= b) { lo = a; hi = b; }
+            std::fprintf(stderr, "strata: cache-aware routing only on layers %lld-%lld (STRATA_CAR_LAYERS)\n", lo, hi);
+        }
+        return std::make_pair((int64_t) lo, (int64_t) hi);
+    }();
+    if (layer < car_layers.first || layer > car_layers.second) return;
     if (d.host_res == nullptr) return;           // no residency table: nothing can be a substitute
 
     std::vector<int32_t>& kept = d.car_kept;    // scratch: the ids the router asked for, before substitution
