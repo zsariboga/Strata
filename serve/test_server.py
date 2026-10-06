@@ -4777,6 +4777,68 @@ class EmptyAssistantTurns(unittest.TestCase):
         kept = [m for i, m in enumerate(self.CHAT) if i not in (1, 3)]
         self.assertNotEqual(self.render(self.CHAT), self.render(kept))
 
+class StoppingThinker(ThinkingEngine):
+    """local #1053: thinks THOUGHT and ends its turn with <|im_end|> WITHOUT </think> (no answer, no tool call); a
+    prompt that already ends its thinking gets ANSWER - unless `always`, then it stops the same way again."""
+    always = False
+
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        self.prompts.append(list(ids))
+        done = self.tok.decode(ids).endswith("</think>\n\n")
+        text = self.ANSWER if done and not self.always else self.THOUGHT
+        for t in (self.tok.encode(text) + self.tok.encode("<|im_end|>", parse_special=True))[:max_new]:
+            if cancel.is_set():
+                return
+            yield t
+
+
+class StopInsideThinking(unittest.TestCase):
+    """local #1053: a reply that stops inside its thinking is closed with </think> once and continued, so an agent
+    gets an answer (or a tool call) instead of an empty turn.  STRATA_STOP_IN_THINKING=0 keeps the old reply."""
+    post = ThinkingBudget.post
+    openai = ThinkingBudget.openai
+
+    def setUp(self):
+        self.tok = ByteTokenizer()
+        self.engine = StoppingThinker(self.tok)
+        self.svc = Service(self.engine, self.tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        self.httpd = serve(self.svc, port=0)
+        self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+        patch = mock.patch.dict(os.environ)
+        patch.start()
+        self.addCleanup(patch.stop)
+        os.environ.pop("STRATA_STOP_IN_THINKING", None)
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+    def test_a_stop_inside_the_thinking_is_closed_and_continued(self):
+        from serve.server import STOP_IN_THINKING_CLOSE
+        code, b = self.openai()
+        self.assertEqual(code, 200, b)
+        msg = b["choices"][0]["message"]
+        self.assertEqual((msg["reasoning_content"].strip(), msg["content"]),
+                         (StoppingThinker.THOUGHT.strip(), StoppingThinker.ANSWER))
+        self.assertEqual(b["choices"][0]["finish_reason"], "stop")
+        first, second = self.engine.prompts
+        extra = self.tok.encode(STOP_IN_THINKING_CLOSE, parse_special=True)
+        self.assertEqual(second, first + self.tok.encode(StoppingThinker.THOUGHT) + extra)
+
+    def test_opt_out_keeps_the_empty_reply(self):
+        os.environ["STRATA_STOP_IN_THINKING"] = "0"
+        code, b = self.openai()
+        self.assertEqual(code, 200, b)
+        msg = b["choices"][0]["message"]
+        self.assertEqual((msg["reasoning_content"], msg.get("content") or ""), (StoppingThinker.THOUGHT, ""))
+        self.assertEqual(len(self.engine.prompts), 1)
+
+    def test_closed_only_once(self):
+        self.engine.always = True
+        code, b = self.openai()
+        self.assertEqual(code, 200, b)
+        self.assertEqual(len(self.engine.prompts), 2)       # one close, then the reply ends as it is
+
 
 class UntimedReads(unittest.TestCase):
     """#1317: a read of the engine's READY line or of the image encoder's pipe that never returns held the request

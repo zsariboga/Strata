@@ -147,6 +147,10 @@ REPEAT_STOP_TOKENS = 256
 # and no call, is continued once with the thinking closed (the same way the budget's wrap-up closes it)
 REASONING_CLOSE = "\n</think>\n\n"
 REASONING_WRAP_UP = "\n\nI have thought about this long enough; time to give my answer.\n</think>\n\n"
+# local (#1053): a reply that stops while still thinking (no </think>, so no answer and no tool call) is closed and
+# continued once, the way #123 closes a thinking budget.  STRATA_STOP_IN_THINKING=0 turns it off.  A call the
+# thinking's rescue (#804) holds is left to the rescue.
+STOP_IN_THINKING_CLOSE = "\n</think>\n\n"
 # #728: opt-in handling of reasoning that repeats whole passages (which the single-token guard above cannot see).
 # "reasoning_loop_recovery": "stop" ends the reply there; "recover" (or true) goes on from the same output with the
 # low-effort instruction in place of the xhigh one.  Both off by default.
@@ -3297,6 +3301,7 @@ class Service:
                     before = getattr(self.engine, "last", None)
                     last_print = time.time()
                     prompt, thought = ids, 0            # thought: the reasoning tokens so far (the budget's count)
+                    stop_close = thinking and os.environ.get("STRATA_STOP_IN_THINKING", "1") != "0"   # local #1053
                     for ev in opening:
                         yield "event", ev
                     while True:
@@ -3306,6 +3311,7 @@ class Service:
                         recover_prompt = None
                         seg, wrap, leaving = [], False, False   # this pass's tokens; the budget is reached; closed
                         opens = False                   # the thinking is over: write the forced call's opening
+                        resume = False                  # local #1053: stopped while still thinking
                         try:
                             for t in gen:
                                 if t is None:               # heartbeat while the engine is quiet
@@ -3319,6 +3325,9 @@ class Service:
                                 if t in self.stop_ids:
                                     finish = "stop"
                                     raw_ids.append(t)
+                                    if stop_close and parser.state == "reasoning" and not parser.buf \
+                                            and not getattr(parser, "pending", None) and not detok.pending():
+                                        resume = True   # local #1053: no </think> yet = no answer, no tool call
                                     break
                                 raw_ids.append(t)
                                 seg.append(t)
@@ -3391,6 +3400,24 @@ class Service:
                             segment_done = getattr(self.engine, "last", None)
                             if segment_done is not None and segment_done is not segment_before:
                                 segments.append(dict(segment_done))
+                        if resume and not cancel.is_set():
+                            # local #1053: the model ended its turn inside the thinking (seen in opencode: an empty
+                            # reply after a tool result, and the agent stops).  Close the thinking once and let it act.
+                            stop_close = False          # once per reply
+                            extra = self.tok.encode(STOP_IN_THINKING_CLOSE, parse_special=True)
+                            if max_new - n - len(extra) >= 1:
+                                print("[strata] the reply stopped inside its thinking (no answer, no tool call): "
+                                      "closing the thinking and letting it answer", flush=True)
+                                for t in extra:
+                                    n += 1
+                                    raw_ids.append(t)
+                                    evs = cut(parser.feed(detok.push(t)))
+                                    self._note(n, evs, st, rate)
+                                    for ev in evs:
+                                        yield "event", ev
+                                finish = "length"
+                                prompt = prompt + seg + extra
+                                continue
                         if recover_prompt is not None and not cancel.is_set() and n < max_new:
                             recovery_count += 1
                             # Only the two settings that keep the same words coming are raised (temperature to at

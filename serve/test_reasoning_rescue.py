@@ -282,6 +282,25 @@ class OverHttp(unittest.TestCase):
                 a = self.ask( "ok</think>\n\n" + body)
                 self.assertEqual(set(a.values()), {want}, a)
 
+# local #1053 (serve/server.py): these tests pin the upstream behaviour of a reply that stops inside its thinking
+# (one pass, the turn ends there); the local close-and-continue is tested in test_server.StopInsideThinking.
+_STOP_IN_THINKING = None
+
+
+def setUpModule():
+    global _STOP_IN_THINKING
+    import os
+    _STOP_IN_THINKING = os.environ.get("STRATA_STOP_IN_THINKING")
+    os.environ["STRATA_STOP_IN_THINKING"] = "0"
+
+
+def tearDownModule():
+    import os
+    if _STOP_IN_THINKING is None:
+        os.environ.pop("STRATA_STOP_IN_THINKING", None)
+    else:
+        os.environ["STRATA_STOP_IN_THINKING"] = _STOP_IN_THINKING
+
 
 if __name__ == "__main__":
     unittest.main()
