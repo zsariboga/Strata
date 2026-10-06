@@ -661,21 +661,26 @@ __device__ __forceinline__ float dot8v(const uint4 w, const float4 x0, const flo
 }
 
 // Stage tile `h` of every token into `buf`: [T][2 planes][160 chunks] float4, plane 0 = floats 0-3 of a chunk.
+template <int NT = THREADS>
 __device__ __forceinline__ void stage_htile(const GrMulti& m, int T, int h, float4* buf, int t) {
-    for (int i = t; i < T * (H_TILE / 4); i += THREADS) {
+    for (int i = t; i < T * (H_TILE / 4); i += NT) {
         const int k = i / (H_TILE / 4), s4 = i - k * (H_TILE / 4);   // s4: float4 of the tile, chunk s4/2, half s4&1
         const float* src = m.xn + (size_t) k * D + (size_t) h * H_TILE + (size_t) s4 * 4;
         cp_async16(buf + (size_t) k * (H_TILE / 4) + (s4 & 1) * (H_TILE / 8) + (s4 >> 1), src);
     }
 }
 
-template <int MAX_T = kFusedGrMaxT, bool EXACT_T = false>
-__global__ void __launch_bounds__(THREADS) gr_down_staged_kernel(GrMulti m) {
+// WPB: warps per block.  8 = the default 40 + 1 blocks; 4 (STRATA_HC_DOWN_W4=1) = 80 + 1 blocks, each row still one
+// warp in the same lane order over the same tiles, so the same bits - only more of the card's SMs take part.
+template <int MAX_T = kFusedGrMaxT, bool EXACT_T = false, int WPB = WARPS>
+__global__ void __launch_bounds__(WPB * 32) gr_down_staged_kernel(GrMulti m) {
+    static_assert(LR % WPB == 0 && WPB >= HC, "whole row groups; the inject block's 4 rows in one block");
+    constexpr int NT = WPB * 32, DB = LR / WPB;
     extern __shared__ __align__(16) float4 hbuf[];      // 2 buffers x [T][2][160] float4
     const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
     const int T = EXACT_T ? MAX_T : m.T;
-    const bool inject_block = blockIdx.x == DOWN_BLOCKS;
-    const int row = inject_block ? warp : blockIdx.x * WARPS + warp;
+    const bool inject_block = blockIdx.x == DB;
+    const int row = inject_block ? warp : blockIdx.x * WPB + warp;
     const bool active = !(inject_block && (m.a[0].w_inject == nullptr || warp >= HC));
     const uint16_t* wrow = (inject_block ? m.a[0].w_inject : m.a[0].w_down) + (size_t) (active ? row : 0) * D;
     const uint4* w4 = reinterpret_cast<const uint4*>(wrow);
@@ -688,9 +693,9 @@ __global__ void __launch_bounds__(THREADS) gr_down_staged_kernel(GrMulti m) {
 #pragma unroll
         for (int q = 0; q < HQ; ++q) wv[q] = __ldg(w4 + lane + 32 * q);
     }
-    stage_htile(m, T, 0, hbuf, t);
+    stage_htile<NT>(m, T, 0, hbuf, t);
     cp_async_commit();
-    stage_htile(m, T, 1, hbuf + buf_f4, t);
+    stage_htile<NT>(m, T, 1, hbuf + buf_f4, t);
     cp_async_commit();
 #pragma unroll 1
     for (int h = 0; h < N_HTILES; ++h) {
@@ -717,7 +722,7 @@ __global__ void __launch_bounds__(THREADS) gr_down_staged_kernel(GrMulti m) {
             }
         }
         __syncthreads();                                // every warp is done with buffer h & 1
-        if (h + 2 < N_HTILES) stage_htile(m, T, h + 2, hbuf + (h & 1) * buf_f4, t);
+        if (h + 2 < N_HTILES) stage_htile<NT>(m, T, h + 2, hbuf + (h & 1) * buf_f4, t);
         cp_async_commit();                              // an empty group at the end keeps the wait counts simple
         if (h + 1 < N_HTILES) {
 #pragma unroll
@@ -801,6 +806,13 @@ int down_chunk(bool staged, int* tile_out) {
         set_staged_attr(gr_down_staged_kernel<6, true>, 6);
         set_staged_attr(gr_down_staged_kernel<4, false>, 4);
         set_staged_attr(gr_down_staged_kernel<kFusedGrMaxT, false>, kFusedGrMaxT);
+        set_staged_attr(gr_down_staged_kernel<1, true, 4>, 1);
+        set_staged_attr(gr_down_staged_kernel<2, true, 4>, 2);
+        set_staged_attr(gr_down_staged_kernel<3, true, 4>, 3);
+        set_staged_attr(gr_down_staged_kernel<4, true, 4>, 4);
+        set_staged_attr(gr_down_staged_kernel<5, true, 4>, 5);
+        set_staged_attr(gr_down_staged_kernel<6, true, 4>, 6);
+        set_staged_attr(gr_down_staged_kernel<kFusedGrMaxT, false, 4>, kFusedGrMaxT);
         cudaGetLastError();      // drop any error the attempt left behind
         // The opt-in is a promise a pre-Volta card does not keep: an sm_60 answers 65536 and accepts the
         // cudaFuncSetAttribute for 61440 B, then fails the LAUNCH with "invalid argument".  What such a card
@@ -847,6 +859,87 @@ bool gr_down_max4() {
     return on;
 }
 
+// fork: STRATA_HC_DOWN_W4=1 / STRATA_HC_UP_FAST=1 (opt-in while measured): the same bits as the default kernels
+bool hc_env(const char* name) {
+    const char* v = std::getenv(name);
+    return v != nullptr && v[0] != '\0' && v[0] != '0';
+}
+bool hc_down_w4() { static const bool on = hc_env("STRATA_HC_DOWN_W4"); return on; }
+#if !defined(__HIPCC__)
+bool hc_up_fast() { static const bool on = hc_env("STRATA_HC_UP_FAST"); return on; }
+// gr_up_fast_kernel (the AMD path) for CUDA: 8 threads a row (two rows each), a row's 5 weight chunks and its
+// epilogue inputs loaded before any dot.  Thread j holds what lane j, j+8, j+16, j+24 of gr_up_multi held (lane j
+// also chunk 32 + j); the xor tree is reproduced: stage 16 pairs (j, j+16) and (j+8, j+24), stage 8 adds the two,
+// then 4, 2, 1 within the 8 threads - the same sums in the same order.
+__device__ __forceinline__ float xor8_sync(float v) {
+#pragma unroll
+    for (int o = 4; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o, 8);
+    return v;
+}
+__global__ void __launch_bounds__(THREADS) gr_up_fast_cuda_kernel(GrMulti m) {
+    __shared__ __align__(16) float lo[kFusedGrMaxT][LR];
+    __shared__ float g[kFusedGrMaxT][HC][UPM_COLS];
+    const int t = threadIdx.x, j = t & 7, grp = t >> 3;
+    const int T = m.T;
+    const int d0 = blockIdx.x * UPM_COLS;
+    static_assert(LR == 40 * 8 && HC * UPM_COLS == 64 && THREADS == 256, "geometry");
+    uint4 w[2][5];
+    float rv[2] = {0.0f, 0.0f}, wn[2] = {0.0f, 0.0f}, rsc[2] = {0.0f, 0.0f}, bo[2] = {0.0f, 0.0f}, ip[2] = {0.0f, 0.0f};
+    const bool apply = j < T && m.a[j < T ? j : 0].apply;
+#pragma unroll
+    for (int p = 0; p < 2; ++p) {
+        const int r = grp + 32 * p, c = r / UPM_COLS, dd = r - c * UPM_COLS, i = c * N + d0 + dd;
+        const uint4* w4 = reinterpret_cast<const uint4*>(m.a[0].w_up + (size_t) i * LR);
+#pragma unroll
+        for (int q = 0; q < 4; ++q) w[p][q] = __ldg(w4 + j + 8 * q);
+        w[p][4] = __ldg(w4 + 32 + j);
+        if (j < T) {
+            const FusedGrArgs& a = m.a[j];
+            rv[p] = a.R[i];
+            wn[p] = a.w_norm[i];
+            rsc[p] = a.rs[c];
+            if (apply) { bo[p] = a.bo_prev[d0 + dd]; ip[p] = a.inj_prev[c]; }
+        }
+    }
+    for (int i = t; i < T * LR; i += THREADS) lo[i / LR][i % LR] = m.a[i / LR].lo[i % LR];
+    __syncthreads();
+#pragma unroll
+    for (int p = 0; p < 2; ++p) {
+        const int r = grp + 32 * p, c = r / UPM_COLS, dd = r - c * UPM_COLS, i = c * N + d0 + dd;
+        float mine = 0.0f;
+#pragma unroll
+        for (int k = 0; k < kFusedGrMaxT; ++k) {
+            if (k >= T) break;
+            const float* l = lo[k];
+            const float p0 = dot8(w[p][0], l + j * 8) + dot8(w[p][4], l + (32 + j) * 8);   // old lane j
+            const float p1 = dot8(w[p][1], l + (j + 8) * 8);                               // old lane j + 8
+            const float p2 = dot8(w[p][2], l + (j + 16) * 8);                              // old lane j + 16
+            const float p3 = dot8(w[p][3], l + (j + 24) * 8);                              // old lane j + 24
+            const float sm = xor8_sync((p0 + p2) + (p1 + p3));
+            if (j == k) mine = sm;
+        }
+        if (j < T) {
+            float x0 = rv[p];
+            if (apply) {
+                x0 = fmaf(bo[p], 2.0f * sigmoidf_(ip[p] / (float) HC), x0);
+                m.a[j].R_out[i] = x0;
+            }
+            const float x = x0 * wn[p] * rsc[p];
+            g[j][c][dd] = x * sigmoidf_(mine);
+        }
+    }
+    __syncthreads();
+    for (int i = t; i < T * UPM_COLS; i += THREADS) {
+        const int k = i / UPM_COLS, col = i - k * UPM_COLS;
+        float sm = 0.0f;
+#pragma unroll
+        for (int c = 0; c < HC; ++c) sm += g[k][c][col];
+        m.a[k].mixed[d0 + col] = sm / (float) HC;
+    }
+    if (m.a[0].q8_mixed != nullptr) gr_q8_tail(m, d0);   // S26 STRATA_QFUSE, as gr_up_multi
+}
+#endif
+
 void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long long* stamp_buf, int stamp_i0) {
     const int n_tok = m.T;
 #if defined(STRATA_HIP_GFX906)
@@ -885,7 +978,16 @@ void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long 
         // kFusedGrMaxT - the same tile, block size, accumulation order and plain/split/staged path, so the same bits
         // (decided once per device: this runs per layer when decode is not captured)
         const bool max4 = ct <= 4 && gr_down_max4();
-        if (staged) {
+        if (staged && hc_down_w4()) {   // fork: 80 + 1 blocks of 4 warps, the same bits
+            constexpr unsigned GB = LR / 4 + 1, BT = 4 * 32;
+            if (exact_t && ct == 1) gr_down_staged_kernel<1, true, 4><<<GB, BT, smem, st>>>(c);
+            else if (exact_t && ct == 2) gr_down_staged_kernel<2, true, 4><<<GB, BT, smem, st>>>(c);
+            else if (exact_t && ct == 3) gr_down_staged_kernel<3, true, 4><<<GB, BT, smem, st>>>(c);
+            else if (exact_t && ct == 4) gr_down_staged_kernel<4, true, 4><<<GB, BT, smem, st>>>(c);
+            else if (exact_t && ct == 5) gr_down_staged_kernel<5, true, 4><<<GB, BT, smem, st>>>(c);
+            else if (exact_t && ct == 6) gr_down_staged_kernel<6, true, 4><<<GB, BT, smem, st>>>(c);
+            else gr_down_staged_kernel<kFusedGrMaxT, false, 4><<<GB, BT, smem, st>>>(c);
+        } else if (staged) {
             // #783 PR-g (stuchapin909): a launch of exactly ct <= 6 tokens is its own instantiation, the loop bounds
             // are compile-time (the same sums in the same order); STRATA_NO_MULTI_GR=1 keeps the generic kernels
             if (exact_t && ct == 1) gr_down_staged_kernel<1, true><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c);
@@ -907,6 +1009,10 @@ void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long 
     if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0 + 1, (void*) st);
 #if defined(STRATA_HIP_GFX906)
     if (fast) gr_up_fast_kernel<<<UPM_BLOCKS, THREADS, 0, st>>>(m);
+    else
+#endif
+#if !defined(__HIPCC__)
+    if (hc_up_fast()) gr_up_fast_cuda_kernel<<<UPM_BLOCKS, THREADS, 0, st>>>(m);
     else
 #endif
     switch (no_multi_gr ? kFusedGrMaxT : n_tok) {
