@@ -49,6 +49,12 @@ CpuTopology detect_cpu_topology(bool skip_first, PoolAffinity affinity) {
         topo.worker_cores.pop_back();
         topo.worker_cores.insert(topo.worker_cores.begin(), topo.host_core);
         topo.host_core = last;
+    } else if (skip_first && host_core_setting() == HostCore::Last && topo.is_hybrid && topo.host_core >= 0 &&
+               !topo.worker_cores.empty() && topo.p_cores >= 2) {
+        // local (#1166's idea for a hybrid CPU without SMT): the P-cores are listed first, so the first worker is the
+        // next P-core.  The host moves there and the first core - where Windows sends the GPU's interrupts - becomes a
+        // worker, whose latency matters less.  Moves threads only, never a result.
+        std::swap(topo.host_core, topo.worker_cores.front());
     }
     return topo;
 }
