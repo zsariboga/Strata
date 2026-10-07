@@ -611,11 +611,73 @@ void ExpertPool::wait_done(int n) {
     }
 }
 
+// local, MEASUREMENT (STRATA_POOL_PROFILE=1): where a native phase's time goes.  Per phase: its wall time (publish ->
+// all done), each thread's wake latency (publish -> its first claim) and busy time (inside its tasks), and the parking
+// waits around it.  A line every 8192 phases; nothing is collected without the variable.
+namespace {
+bool pool_prof_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_POOL_PROFILE"); return v != nullptr && v[0] == '1'; }();
+    return on;
+}
+int64_t prof_now_ns() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+std::atomic<int64_t> g_ph_begin_ns{0};
+std::atomic<int64_t> g_ph_busy_ns{0}, g_ph_wake_ns{0}, g_ph_wakers{0}, g_ph_claimers{0}, g_ph_tasks{0};
+std::atomic<int64_t> g_ph_tail_ns{0};   // last finish - first finish among the threads that worked
+std::atomic<int64_t> g_ph_first_end{0}, g_ph_last_end{0};
+int64_t g_ph_n = 0, g_ph_wall_ns = 0, g_ph_park_ns = 0, g_ph_threads = 0;
+
+// local, EXPERIMENT (STRATA_POOL_GUIDED=1): guided self-scheduling for the native phases.  Equal row ranges leave a
+// tail: a slow E-core that claims one of the last ranges keeps the whole phase waiting (STRATA_POOL_PROFILE measured
+// first->last finish 37 us of a 150 us phase).  Here each range is the remaining rows / (2 x threads), never below
+// STRATA_POOL_GUIDED_MIN rows (16), so the first ranges are large (locality) and the last are small (short tail).
+// Every row is still computed once and the same way: bitwise the same output.
+std::vector<int64_t> g_guided;   // boundaries [0, b1, ..., rows]; empty = the equal split
+bool pool_guided_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_POOL_GUIDED"); return v != nullptr && v[0] == '1'; }();
+    return on;
+}
+int guided_bounds(int64_t rows, int threads) {
+    static const int64_t mn = [] { const char* v = std::getenv("STRATA_POOL_GUIDED_MIN"); return (int64_t) (v ? std::atoi(v) : 16); }();
+    g_guided.clear();
+    g_guided.push_back(0);
+    int64_t done = 0;
+    while (done < rows) {
+        int64_t c = (rows - done + 2 * threads - 1) / (2 * threads);
+        if (c < mn) c = mn;
+        if (c > rows - done) c = rows - done;
+        done += c;
+        g_guided.push_back(done);
+    }
+    return (int) g_guided.size() - 1;
+}
+}  // namespace
+
 void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
     (void) id;
+    const bool prof = pool_prof_on() && mode_ >= 5;
+    int64_t busy = 0, first_claim = 0;
+    struct ProfDone {
+        bool on; int64_t& busy; int64_t& first;
+        ~ProfDone() {
+            if (!on || first == 0) return;
+            const int64_t end = prof_now_ns();
+            g_ph_busy_ns.fetch_add(busy, std::memory_order_relaxed);
+            g_ph_wake_ns.fetch_add(first - g_ph_begin_ns.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            g_ph_wakers.fetch_add(1, std::memory_order_relaxed);
+            int64_t fe = g_ph_first_end.load(std::memory_order_relaxed);
+            while ((fe == 0 || end < fe) && !g_ph_first_end.compare_exchange_weak(fe, end)) {}
+            int64_t le = g_ph_last_end.load(std::memory_order_relaxed);
+            while (end > le && !g_ph_last_end.compare_exchange_weak(le, end)) {}
+        }
+    } prof_done{prof, busy, first_claim};
     for (;;) {
+        const int64_t tc0 = prof ? prof_now_ns() : 0;
         const int ci = claim(epoch);
         if (ci < 0) break;
+        if (prof && first_claim == 0) first_claim = tc0;
+        if (prof) g_ph_tasks.fetch_add(1, std::memory_order_relaxed);
         const uint32_t i = (uint32_t) ci;
         if (id >= 0) wstate_[(size_t) id].store(ci, std::memory_order_relaxed);
         else { hstate_.store(ci, std::memory_order_relaxed); hstate_ms_.store(now_ms(), std::memory_order_relaxed); }
@@ -633,7 +695,8 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
         } else if (mode_ >= 5) {
             // plan v0.3 P6: native layers, 5 = gate/up rows, 6 = down rows
             const int per = mode_ == 5 ? FF : H;
-            const int64_t g0 = mrows_ * (int64_t) i / mtasks_, g1 = mrows_ * (int64_t) (i + 1) / mtasks_;
+            int64_t g0 = mrows_ * (int64_t) i / mtasks_, g1 = mrows_ * (int64_t) (i + 1) / mtasks_;
+            if (!g_guided.empty()) { g0 = g_guided[i]; g1 = g_guided[i + 1]; }   // local: STRATA_POOL_GUIDED
             for (int64_t r = g0; r < g1;) {
                 const int e = (int) (r / per), r0 = (int) (r % per);
                 const int r1 = (int) std::min<int64_t>(per, r0 + (g1 - r));
@@ -687,20 +750,50 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
                 r += r1 - r0;
             }
         }
+        if (prof) busy += prof_now_ns() - tc0;
         done_.fetch_add(1, std::memory_order_release);
     }
 }
 
 void ExpertPool::run_phase(int mode, int n_tasks) {
+    const bool prof = pool_prof_on() && mode >= 5;
+    const int64_t p0 = prof ? prof_now_ns() : 0;
     wait_parked("before a phase");
     mode_ = mode;
     njobs_ = n_tasks;
+    const int64_t p1 = prof ? prof_now_ns() : 0;
+    if (prof) {
+        g_ph_begin_ns.store(p1, std::memory_order_relaxed);
+        g_ph_first_end.store(0, std::memory_order_relaxed);
+        g_ph_last_end.store(0, std::memory_order_relaxed);
+    }
     const uint32_t e = begin_batch(n_tasks);
     if (host_works_) drain(-1, host_scratch_, e);
     wait_done(n_tasks);
+    const int64_t p2 = prof ? prof_now_ns() : 0;
     wait_parked("after a phase");
     hstate_.store(kIdle, std::memory_order_relaxed);
     hstate_ms_.store(now_ms(), std::memory_order_relaxed);
+    if (prof) {
+        const int64_t p3 = prof_now_ns();
+        g_ph_n += 1;
+        g_ph_wall_ns += p2 - p1;
+        g_ph_park_ns += (p1 - p0) + (p3 - p2);
+        g_ph_threads += n_ + (host_works_ ? 1 : 0);
+        const int64_t fe = g_ph_first_end.load(), le = g_ph_last_end.load();
+        if (fe > 0 && le >= fe) g_ph_tail_ns.fetch_add(le - fe, std::memory_order_relaxed);
+        if (g_ph_n % 8192 == 0) {
+            const double n = (double) g_ph_n;
+            const double wall = g_ph_wall_ns / n / 1000.0, park = g_ph_park_ns / n / 1000.0;
+            const double busy = g_ph_busy_ns.load() / n / 1000.0, thr = g_ph_threads / n;
+            const double wakers = g_ph_wakers.load() / n, wake = g_ph_wake_ns.load() / (std::max)(1.0, (double) g_ph_wakers.load()) / 1000.0;
+            std::fprintf(stderr,
+                         "strata pool profile: %lld phases | per phase: wall %.1f us, park %.1f us | threads %.1f, of them worked %.1f "
+                         "| busy %.1f us total = %.0f%% of threads x wall | wake %.1f us avg | first->last finish %.1f us | tasks %.1f\n",
+                         (long long) g_ph_n, wall, park, thr, wakers, busy, 100.0 * busy / (std::max)(1e-9, thr * wall), wake,
+                         g_ph_tail_ns.load() / n / 1000.0, g_ph_tasks.load() / n);
+        }
+    }
 }
 
 void ExpertPool::run_split(ExpertJob* jobs, int n) {
@@ -771,7 +864,7 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
         mjobs_ = jobs + b0;
         nfmt_ = &f;
         mrows_ = (int64_t) nb * FF;
-        mtasks_ = phase_tasks(mrows_);
+        mtasks_ = pool_guided_on() ? guided_bounds(mrows_, n_ + (host_works_ ? 1 : 0)) : phase_tasks(mrows_);
         const auto a = std::chrono::steady_clock::now();
         run_phase(5, mtasks_);
         const auto b = std::chrono::steady_clock::now();
@@ -781,8 +874,9 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
                 else native_quant_h(f, split_multi_[(size_t) e].ff[t], split_multi_[(size_t) e].hq[t]);
         const auto c = std::chrono::steady_clock::now();
         mrows_ = (int64_t) nb * H;
-        mtasks_ = phase_tasks(mrows_);
+        mtasks_ = pool_guided_on() ? guided_bounds(mrows_, n_ + (host_works_ ? 1 : 0)) : phase_tasks(mrows_);
         run_phase(6, mtasks_);
+        g_guided.clear();   // the next caller (another phase kind) splits evenly unless it builds its own
         const auto d = std::chrono::steady_clock::now();
         ms_multi_gu += std::chrono::duration<double, std::milli>(b - a).count();
         ms_multi_q += std::chrono::duration<double, std::milli>(c - b).count();
