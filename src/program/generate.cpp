@@ -9928,22 +9928,49 @@ int main(int argc, char** argv) {
                 const char* a = std::getenv("STRATA_TYPICAL_ANSWER");
                 return a != nullptr && a[0] == '1';
             }();
+            // local loop guard (STRATA_LOOP_GUARD=0 turns it off): while the last 48 tokens repeat a pattern of 1-16
+            // tokens, the lossy rules (STRATA_TYPICAL margin, CAR) are off.  A margin rule keeps a draft whose
+            // probability is a fair share of the top's, so a loop token with p = 0.4 against an exit with p = 0.6
+            // is kept every time and the loop can never end; exact sampling leaves it at the model's own rate.
+            static const bool loop_guard = [] {
+                const char* v = std::getenv("STRATA_LOOP_GUARD");
+                return v == nullptr || v[0] != '0';
+            }();
             struct TypState {
-                bool think = false, tool = false, fence = false;
+                bool think = false, tool = false, fence = false, loop = false;
+                int64_t loop_tokens = 0, loop_spans = 0;
+                int32_t last[64] = {};
+                int64_t seen = 0;
                 void feed(int64_t id) {
                     if (id == 248068) { think = true; fence = false; }
                     else if (id == 248069) { think = false; fence = false; }
                     else if (id == 248058) tool = true;
                     else if (id == 248059) tool = false;
                     else if ((id == 71093 || id == 52451) && !tool) fence = !fence;
+                    if (!loop_guard) return;
+                    last[seen & 63] = (int32_t) id;
+                    ++seen;
+                    constexpr int kW = 48, kP = 16;
+                    bool rep = false;
+                    if (seen >= kW + kP)
+                        for (int p = 1; p <= kP && !rep; ++p) {
+                            rep = true;
+                            for (int i = 0; i < kW && rep; ++i)
+                                rep = last[(seen - 1 - i) & 63] == last[(seen - 1 - i - p) & 63];
+                        }
+                    if (rep && !loop) ++loop_spans;
+                    loop = rep;
+                    loop_tokens += rep;
                 }
-                bool lossy(bool answer) const { return answer ? !tool && !fence : think; }
+                void reset_history() { seen = 0; loop = false; }
+                bool lossy(bool answer) const { return !loop && (answer ? !tool && !fence : think); }
             } typ_st;
             {
                 int64_t s = 0;
                 for (int64_t i = n - 1; i >= 0; --i)
                     if (ids[(size_t) i] == 248045) { s = i; break; }
                 for (int64_t i = s; i < n; ++i) typ_st.feed(ids[(size_t) i]);
+                typ_st.reset_history();   // the loop guard looks at the reply only
                 ver.set_typical_open(typ_st.lossy(typ_answer));
             }
             const char* finish = "length";
@@ -10672,8 +10699,9 @@ int main(int argc, char** argv) {
                         const std::string s = v != nullptr ? v : "";
                         return s == "all" ? 2 : s == "answer" ? 1 : 0;
                     }();
-                    bool car_open = car_scope == 2 ||
-                                    (car_scope == 1 ? (!typ_st.tool && !typ_st.fence) : (typ_st.think && !typ_st.tool));
+                    bool car_open = !typ_st.loop &&
+                                    (car_scope == 2 ||
+                                     (car_scope == 1 ? (!typ_st.tool && !typ_st.fence) : (typ_st.think && !typ_st.tool)));
                     if (car_open && car_scope != 2)
                         for (int t = 1; t < T; ++t) {
                             const int32_t w = window[(size_t) t];
@@ -11107,6 +11135,9 @@ int main(int argc, char** argv) {
                              (unsigned long long) look, (double) miss * 4224.0 / 1048576.0,
                              over ? " - OVERFLOW (too few resident cells)" : "");
             }
+            if (typ_st.loop_spans > 0)
+                std::fprintf(stderr, "strata serve: loop guard: %lld repeating spans, %lld tokens without the lossy rules\n",
+                             (long long) typ_st.loop_spans, (long long) typ_st.loop_tokens);
             if (sfx_windows > 0)
                 std::fprintf(stderr, "strata serve: suffix drafts: %lld windows, %lld of %lld drafts accepted\n",
                              (long long) sfx_windows, (long long) sfx_ok, (long long) sfx_drafts);
