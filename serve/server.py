@@ -142,6 +142,9 @@ VISION_START = "<|vision_start|>"
 # broken state that answers one token forever (an issue saw 36,689 tokens of "!"). The config's "repeat_stop_tokens"
 # sets it; 0 turns it off.
 REPEAT_STOP_TOKENS = 256
+# local (opt-in, the config's "pattern_stop_tokens"): a reply whose short pattern (2..16 tokens, "ÇtaÇtaÇta...")
+# repeats this many tokens in a row is ended the same way. Off by default: two alternating tokens can be content.
+PERIOD_STOP_MAX = 16
 # #123: what closes the thinking when it reaches reasoning_budget_tokens (the model's own end-of-thinking tag after it)
 # #1053 (opt-in "reasoning_close_retry": true): a reply that ends on its stop token still inside <think>, with no answer
 # and no call, is continued once with the thinking closed (the same way the budget's wrap-up closes it)
@@ -2456,6 +2459,7 @@ class Service:
         self.reasoning_budget_by_effort = {}             # yerel yama: efor -> dusunme butcesi (config)
         self.hide_reasoning_wrap_up = False              # local: keep the budget's wrap-up sentence out of replies
         self.repeat_stop_tokens = REPEAT_STOP_TOKENS     # #606: one token this many times in a row ends a reply (0: off)
+        self.pattern_stop_tokens = 0                     # local: a 2-16 token pattern this many tokens in a row (0: off)
         self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
         self.tool_call_recovery = False                   # opt-in: tool calls in forms next to the template's
         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
@@ -3230,6 +3234,9 @@ class Service:
         parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True, recover=self.tool_call_recovery)
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         run_tok, run_len, repeated = None, 0, False     # #606: the current run of one repeated token
+        # local: the same for a short pattern (pattern_stop_tokens): run_p[p] counts the tokens in a row that equal
+        # the token p before them
+        run_p, period_hit = [0] * (PERIOD_STOP_MAX + 1), 0
         thinking_n = 0                                  # tokens written while thinking (Responses' reasoning_tokens)
         stop_list = stop_strings(sampling)
         stops = StopMatcher(stop_list) if stop_list else None
@@ -3337,6 +3344,15 @@ class Service:
                                 if self.repeat_stop_tokens and run_len >= self.repeat_stop_tokens:
                                     repeated = True     # #606: a degenerate output, not an answer: end it here
                                     break
+                                if self.pattern_stop_tokens:
+                                    m = len(raw_ids)
+                                    for p in range(2, PERIOD_STOP_MAX + 1):
+                                        run_p[p] = run_p[p] + 1 if m > p and raw_ids[m - 1 - p] == t else 0
+                                        if not period_hit and run_p[p] >= self.pattern_stop_tokens:
+                                            period_hit = p
+                                    if period_hit:
+                                        repeated = True     # local: a short pattern looping, as #606
+                                        break
                                 piece = detok.push(t)
                                 tail = (tail + piece)[-2:]
                                 evs = cut(parser.feed(piece))
@@ -3506,6 +3522,11 @@ class Service:
                         print(f"[strata] the thinking repeated the same passages (coverage={repeat_coverage:.3f}) at "
                               f"{n} tokens: ended as \"length\" (reasoning_loop_recovery: \"stop\" in "
                               "strata-<model>.json; remove it to turn this off)", flush=True)
+                    elif repeated and period_hit:
+                        pat = self.tok.decode(raw_ids[-period_hit:])
+                        print(f"[strata] the reply repeated a {period_hit}-token pattern ({pat!r}) "
+                              f"{run_p[period_hit]} tokens in a row: ended as \"length\" (pattern_stop_tokens in "
+                              "strata-<model>.json; 0 or no key turns this off)", flush=True)
                     elif repeated:
                         print(f"[strata] the reply repeated one token ({self.tok.decode([run_tok])!r}) "
                               f"{run_len} times in a row: ended as \"length\" (repeat_stop_tokens in "
@@ -5578,6 +5599,10 @@ def main() -> int:
     if isinstance(rs, bool) or not isinstance(rs, int) or rs < 0:
         raise SystemExit(f"[strata] config \"repeat_stop_tokens\" must be a whole number >= 0 (0 = off), not {rs!r}")
     svc.repeat_stop_tokens = rs
+    ps = cfg.get("pattern_stop_tokens", 0)                  # local: opt-in short-pattern loop stop
+    if isinstance(ps, bool) or not isinstance(ps, int) or ps < 0:
+        raise SystemExit(f"[strata] config \"pattern_stop_tokens\" must be a whole number >= 0 (0 = off), not {ps!r}")
+    svc.pattern_stop_tokens = ps
     svc.effort_end = bool(effort_end)                   # #458: "effort_position": "end" with an engine that has it
     if cfg.get("reasoning_budget_tokens") is not None:  # #123: a default thinking budget for every request
         try:

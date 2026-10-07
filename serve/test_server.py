@@ -1965,6 +1965,37 @@ class RepeatStop(unittest.TestCase):
         self.assertEqual(done["finish"], "stop")
 
 
+class PatternStop(unittest.TestCase):
+    """local: a 2-16 token pattern repeated pattern_stop_tokens tokens in a row ends the reply as "length"; off by
+    default (0)."""
+
+    def run_reply(self, script, limit):
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, script, max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        svc.pattern_stop_tokens = limit
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            done = [x for kind, x in svc.run(tok.encode("hi"), False, None, 3000, {}, threading.Event())
+                    if kind == "done"][0]
+        return done, out.getvalue()
+
+    def test_a_looping_pattern_is_ended(self):
+        done, log = self.run_reply("ok " + "Cta" * 400 + " never", 512)
+        self.assertEqual(done["finish"], "length")
+        self.assertEqual(done["completion_tokens"], 3 + 3 + 512)     # the first 3 open the pattern, then 512 repeat it
+        self.assertIn("repeated a 3-token pattern ('", log)
+        done, _ = self.run_reply("ok " + "ab" * 400, 512)
+        self.assertEqual(done["finish"], "length")
+
+    def test_off_and_short_runs(self):
+        done, log = self.run_reply("Cta" * 400, 0)                   # the default: off
+        self.assertEqual(done["finish"], "stop")
+        self.assertNotIn("pattern", log)
+        done, _ = self.run_reply("".join(f"| {i} | b |\n" for i in range(100)) + "end", 512)   # rows that differ
+        self.assertEqual(done["finish"], "stop")
+        done, _ = self.run_reply("ab" * 200 + " done", 512)          # 398 in a row: under the limit
+        self.assertEqual(done["finish"], "stop")
+
+
 class LayerSplit(unittest.TestCase):
     """#644: "layer_split" is the first layer of each later GPU; a list is accepted, counts per card are not."""
 
