@@ -1206,6 +1206,7 @@ class UnfinishedToolCall(unittest.TestCase):
             httpd.server_close()
         return out
 
+    @mock.patch.dict(os.environ, {"STRATA_STOP_MID_CALL": "0"})   # local: the turn ends there for good
     def test_a_cut_call(self):
         cut = '{"path":"notes.txt","content":"first half of the fi'
         self.assertEqual(self.answers(self.CUT), {

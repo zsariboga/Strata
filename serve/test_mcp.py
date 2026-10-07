@@ -12,6 +12,7 @@ import tempfile
 import threading
 import time
 import unittest
+import unittest.mock
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -298,6 +299,7 @@ class ToolLoop(unittest.TestCase):
         self.assertIn("<tool_response>\nhello from the tool\n</tool_response>", second)
         self.assertEqual(cs[-1]["usage"]["prompt_tokens"], len(self.engine.prompts[1]))
 
+    @unittest.mock.patch.dict(os.environ, {"STRATA_STOP_MID_CALL": "0"})   # local: the turn ends there for good
     def test_a_call_the_output_ends_inside_is_not_run(self):
         """#211: the model's turn ends inside an MCP call: nothing runs (it used to run with no arguments)."""
         script = call_script("fake__echo", text="hello from the tool")
