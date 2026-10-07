@@ -3312,6 +3312,7 @@ class Service:
                     # local: a reply that ends inside a tool call it is writing (the call is cut), or that closes its
                     # thinking and ends with nothing after it, gets its stop token dropped and goes on once
                     stop_resume = os.environ.get("STRATA_STOP_MID_CALL", "1") != "0"
+                    acted = False                   # local: any answer text or tool call in this reply yet
                     for ev in opening:
                         yield "event", ev
                     while True:
@@ -3339,7 +3340,7 @@ class Service:
                                     if stop_resume and not detok.pending() and (
                                             (parser.state == "call" and getattr(parser, "ss", None) != "done") or
                                             (parser.state == "content" and getattr(parser, "lead", False)
-                                             and not parser.buf)):
+                                             and not parser.buf and not acted)):
                                         resume_on = True
                                     if stop_close and parser.state == "reasoning" and not parser.buf \
                                             and not getattr(parser, "pending", None) and not detok.pending():
@@ -3366,6 +3367,9 @@ class Service:
                                 tail = (tail + piece)[-2:]
                                 evs = cut(parser.feed(piece))
                                 self._note(n, evs, st, rate)
+                                acted = acted or any(ev.kind in ("tool_start", "tool_call") or
+                                                     (ev.kind == "content" and (ev.text or "").strip())
+                                                     for ev in evs)
                                 last_print = self._progress(last_print, st=st)
                                 for ev in evs:
                                     if self.reasoning_loop_recovery and ev.kind == "reasoning":
