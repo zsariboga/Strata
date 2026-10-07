@@ -3309,6 +3309,9 @@ class Service:
                     last_print = time.time()
                     prompt, thought = ids, 0            # thought: the reasoning tokens so far (the budget's count)
                     stop_close = thinking and os.environ.get("STRATA_STOP_IN_THINKING", "1") != "0"   # local #1053
+                    # local: a reply that ends inside a tool call it is writing (the call is cut), or that closes its
+                    # thinking and ends with nothing after it, gets its stop token dropped and goes on once
+                    stop_resume = os.environ.get("STRATA_STOP_MID_CALL", "1") != "0"
                     for ev in opening:
                         yield "event", ev
                     while True:
@@ -3319,6 +3322,7 @@ class Service:
                         seg, wrap, leaving = [], False, False   # this pass's tokens; the budget is reached; closed
                         opens = False                   # the thinking is over: write the forced call's opening
                         resume = False                  # local #1053: stopped while still thinking
+                        resume_on = False               # local: stopped mid-call / with nothing after the thinking
                         try:
                             for t in gen:
                                 if t is None:               # heartbeat while the engine is quiet
@@ -3332,6 +3336,11 @@ class Service:
                                 if t in self.stop_ids:
                                     finish = "stop"
                                     raw_ids.append(t)
+                                    if stop_resume and not detok.pending() and (
+                                            (parser.state == "call" and getattr(parser, "ss", None) != "done") or
+                                            (parser.state == "content" and getattr(parser, "lead", False)
+                                             and not parser.buf)):
+                                        resume_on = True
                                     if stop_close and parser.state == "reasoning" and not parser.buf \
                                             and not getattr(parser, "pending", None) and not detok.pending():
                                         resume = True   # local #1053: no </think> yet = no answer, no tool call
@@ -3416,6 +3425,16 @@ class Service:
                             segment_done = getattr(self.engine, "last", None)
                             if segment_done is not None and segment_done is not segment_before:
                                 segments.append(dict(segment_done))
+                        if resume_on and not resume and not cancel.is_set() and n < max_new:
+                            stop_resume = False         # once per reply
+                            if raw_ids and raw_ids[-1] in self.stop_ids:
+                                raw_ids.pop()           # the stop token is not part of the reply
+                            print("[strata] the reply ended " + ("inside a tool call" if parser.state == "call" else
+                                  "right after its thinking with no answer") + ": dropping the stop and going on once",
+                                  flush=True)
+                            finish = "length"
+                            prompt = prompt + seg
+                            continue
                         if resume and not cancel.is_set():
                             # local #1053: the model ended its turn inside the thinking (seen in opencode: an empty
                             # reply after a tool result, and the agent stops).  Close the thinking once and let it act.

@@ -4955,5 +4955,89 @@ class UntimedReads(unittest.TestCase):
         self.assertEqual(v._readline(5.0, "x"), "OK 7 1 1 1\n")
 
 
+class CutCaller(ThinkingEngine):
+    """local: thinks, closes the thinking and starts a call, but ends its turn with <|im_end|> in the middle of the
+    call's arguments; a prompt that ends inside that call gets the rest of it.  `silent`: ends right after </think>
+    instead (no answer, no call).  `always`: it stops the same way again."""
+    HEAD = "<tool_call>\n<function=search>\n<parameter=q>\n2+"
+    REST = "2\n</parameter>\n</function>\n</tool_call>"
+    always = False
+    silent = False
+
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        self.prompts.append(list(ids))
+        prompt = self.tok.decode(ids)
+        if prompt.endswith(self.HEAD) and not self.always:
+            text = self.REST
+        elif prompt.endswith("</think>\n\n") and self.silent and not self.always:
+            text = self.ANSWER
+        elif prompt.endswith(self.HEAD) or prompt.endswith("</think>\n\n"):
+            text = ""
+        else:
+            text = self.THOUGHT + "</think>\n\n" + ("" if self.silent else self.HEAD)
+        for t in (self.tok.encode(text) + self.tok.encode("<|im_end|>", parse_special=True))[:max_new]:
+            if cancel.is_set():
+                return
+            yield t
+
+
+class StopMidCall(unittest.TestCase):
+    """local: a reply that ends in the middle of a tool call (the call is cut) or right after its thinking with
+    nothing written gets its stop token dropped and goes on once.  STRATA_STOP_MID_CALL=0 keeps the old reply."""
+    post = ThinkingBudget.post
+    TOOLS = [{"type": "function", "function": {"name": "search", "description": "search the web",
+                                               "parameters": {"type": "object",
+                                                              "properties": {"q": {"type": "string"}},
+                                                              "required": ["q"]}}}]
+
+    def setUp(self):
+        self.tok = ByteTokenizer()
+        self.engine = CutCaller(self.tok)
+        self.svc = Service(self.engine, self.tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        self.httpd = serve(self.svc, port=0)
+        self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+        patch = mock.patch.dict(os.environ)
+        patch.start()
+        self.addCleanup(patch.stop)
+        os.environ.pop("STRATA_STOP_MID_CALL", None)
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+    def openai(self, **extra):
+        return self.post("/v1/chat/completions", {"model": "m", "messages": [{"role": "user", "content": "2+2?"}],
+                                                  "max_tokens": 600, "tools": self.TOOLS, **extra})
+
+    def test_a_call_cut_by_the_stop_token_is_finished(self):
+        code, b = self.openai()
+        self.assertEqual(code, 200, b)
+        msg = b["choices"][0]["message"]
+        self.assertEqual(b["choices"][0]["finish_reason"], "tool_calls", b)
+        self.assertEqual([(c["function"]["name"], json.loads(c["function"]["arguments"])) for c in msg["tool_calls"]],
+                         [("search", {"q": "2+2"})])
+        first, second = self.engine.prompts
+        self.assertEqual(second, first + self.tok.encode(CutCaller.THOUGHT + "</think>\n\n" + CutCaller.HEAD))
+
+    def test_nothing_after_the_thinking_goes_on_once(self):
+        self.engine.silent = True
+        code, b = self.openai()
+        self.assertEqual(code, 200, b)
+        self.assertEqual(b["choices"][0]["message"]["content"], CutCaller.ANSWER)
+        self.assertEqual(len(self.engine.prompts), 2)
+
+    def test_only_once(self):
+        self.engine.always = True
+        code, b = self.openai()
+        self.assertEqual(code, 200, b)
+        self.assertEqual(len(self.engine.prompts), 2)       # one more pass, then the reply ends as it is
+
+    def test_opt_out_keeps_the_cut_reply(self):
+        os.environ["STRATA_STOP_MID_CALL"] = "0"
+        code, b = self.openai()
+        self.assertEqual(code, 200, b)
+        self.assertEqual(len(self.engine.prompts), 1)
+        self.assertFalse(b["choices"][0]["message"].get("tool_calls"))
+
 if __name__ == "__main__":
     unittest.main()
