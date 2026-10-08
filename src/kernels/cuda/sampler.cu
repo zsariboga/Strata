@@ -1253,11 +1253,38 @@ bool sample_greedy_cluster(const float* logits, int n_tokens, int n_vocab, int* 
 #endif
 }
 
+// local (STRATA_THINK_BAN): a bias on a few token ids' logits, added in place before the pick while the mapped
+// `bias` is non-zero (the engine sets it per window: inside the thinking only).  A kernel captured into the verify
+// graphs like the sampler itself; it reads the bias when it runs, so turning it on or off needs no recapture.
+namespace {
+struct LogitBan { const int32_t* ids = nullptr; int n = 0; int vocab = 0; const float* bias = nullptr; };
+LogitBan g_ban;
+__global__ void logit_ban_kernel(float* logits, int n_tokens, int n_vocab, const int32_t* ids, int n,
+                                 const float* bias) {
+    const float b = *(volatile const float*) bias;
+    if (b == 0.0f) return;
+    for (int i = threadIdx.x; i < n_tokens * n; i += blockDim.x) {
+        const int r = i / n, id = ids[i % n];
+        if (id >= 0 && id < n_vocab) logits[(size_t) r * (size_t) n_vocab + (size_t) id] += b;
+    }
+}
+}  // namespace
+
+void set_logit_ban(const int32_t* d_ids, int n, int vocab, const float* d_bias) {
+    g_ban.ids = d_ids;
+    g_ban.n = n;
+    g_ban.vocab = vocab;
+    g_ban.bias = d_bias;
+}
+
 void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
                    const SamplerParams& p_in, int* out, void* stream) {
     SamplerParams p = p_in;
     p.gumbel = p_in.gumbel || gumbel_env();            // the target's pick; greedy rows never read it
     if (n_tokens <= 0 || n_vocab <= 0) return;
+    if (g_ban.n > 0 && n_vocab == g_ban.vocab)          // the target's full vocabulary only (not a draft's)
+        logit_ban_kernel<<<1, 128, 0, (cudaStream_t) stream>>>(const_cast<float*>(logits), n_tokens, n_vocab,
+                                                               g_ban.ids, g_ban.n, g_ban.bias);
     if (p.penalty_last_n > 0 && (history == nullptr || history_len <= 0)) {
         std::fprintf(stderr, "sample_tokens: penalty_last_n %d needs a history (got %p, len %d)\n",
                      p.penalty_last_n, (const void*) history, history_len);

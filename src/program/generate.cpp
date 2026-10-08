@@ -114,6 +114,45 @@
 #include <vector>
 
 namespace {
+// local (STRATA_THINK_BAN, opt-in, LOSSY - it changes what the model writes): "NoWait" (arXiv 2506.08343) - a few
+// token ids (the reflection openers: Wait, Hmm, Actually, Alternatively) get STRATA_THINK_BAN_BIAS (default -100)
+// added to their logits while the reply is inside its thinking and not writing a call.  `host` is the mapped bias the
+// sampler's ban kernel reads at run time (0 = off); the serve loop sets it per window.
+struct ThinkBan { float* host = nullptr; float bias = 0.0f; };
+ThinkBan& think_ban() { static ThinkBan b; return b; }
+void think_ban_init() {
+    const char* v = std::getenv("STRATA_THINK_BAN");
+    if (v == nullptr || *v == '\0' || think_ban().host != nullptr) return;
+    std::vector<int32_t> ids;
+    for (const char* s = v; *s;) {
+        char* end = nullptr;
+        const long x = std::strtol(s, &end, 10);
+        if (end == s) { ++s; continue; }
+        ids.push_back((int32_t) x);
+        s = end;
+    }
+    if (ids.empty()) return;
+    const char* b = std::getenv("STRATA_THINK_BAN_BIAS");
+    const char* vv = std::getenv("STRATA_THINK_BAN_VOCAB");
+    const float bias = b ? (float) std::atof(b) : -100.0f;
+    const int vocab = vv ? std::atoi(vv) : 248320;
+    int32_t* d_ids = nullptr;
+    float* h = nullptr;
+    float* d_bias = nullptr;
+    if (cudaMalloc((void**) &d_ids, ids.size() * sizeof(int32_t)) != cudaSuccess ||
+        cudaMemcpy(d_ids, ids.data(), ids.size() * sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaHostAlloc((void**) &h, sizeof(float), cudaHostAllocMapped) != cudaSuccess ||
+        cudaHostGetDevicePointer((void**) &d_bias, h, 0) != cudaSuccess) {
+        std::fprintf(stderr, "strata serve: STRATA_THINK_BAN could not be set up; off\n");
+        return;
+    }
+    *(volatile float*) h = 0.0f;
+    strata::kernels::set_logit_ban(d_ids, (int) ids.size(), vocab, d_bias);
+    think_ban().host = h;
+    think_ban().bias = bias;
+    std::fprintf(stderr, "strata serve: STRATA_THINK_BAN: %zu token ids get %.1f inside the thinking (vocab %d)\n",
+                 ids.size(), bias, vocab);
+}
 // Windows' WDDM driver model: native Windows, or WSL2 (its GPU goes through /dev/dxg to the Windows driver).  There,
 // pinning a large arena into two CUDA contexts leaves WDDM refusing every later allocation (the 5080 + 3090 rig);
 // a Linux driver has no such limit (#253: the 8 GiB cap cost a 4090 + 3060 split 3x of its prompt speed).
@@ -6871,6 +6910,7 @@ int main(int argc, char** argv) {
         }
         ver.set_remote_expert_opt(remote_opt.get());
         set_car_on(ver);
+        think_ban_init();
         if (batch_mtp) ver.set_batch_graph_limit(64);   // --batch-mtp only: slot rotation makes many layouts (LRU); 0.1.39 keeps all
         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr,
                       batch_mtp ? strata::kernels::kVerifyMaxT : std::max(o.spec, o.batch), err) ||
@@ -10955,6 +10995,10 @@ int main(int argc, char** argv) {
                                 w == 71093 || w == 52451) { car_open = false; break; }
                         }
                     drive.d.car_open = car_open;
+                    // local (STRATA_THINK_BAN): the reflection openers lose their weight inside the thinking only
+                    if (think_ban().host != nullptr)
+                        *(volatile float*) think_ban().host =
+                            (typ_st.think && !typ_st.tool && !typ_st.loop) ? think_ban().bias : 0.0f;
                 }
                 if (!ver.run(T, window.data(), p, win_pool_fn, win_pool_user, outv.data(), err) || drive.d.failed) {
                     std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
