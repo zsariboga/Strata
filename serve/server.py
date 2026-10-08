@@ -3597,6 +3597,7 @@ class Service:
                             else self.engine.generate(prompt, max_new - n, sampling, cancel)
                         recover_prompt = None
                         seg, wrap, leaving = [], False, False   # this pass's tokens; the budget is reached; closed
+                        loop_wrapped = False            # local: wrap set by reasoning_loop_recovery "wrap"
                         opens = False                   # the thinking is over: write the forced call's opening
                         resume_on = False               # local: stopped mid-call / with nothing after the thinking
                         try:
@@ -3660,6 +3661,15 @@ class Service:
                                     if repeat_coverage >= LOOP_COVERAGE:
                                         if self.reasoning_loop_recovery == "stop":
                                             looped = True        # #728: end the reply here, as for a repeated token
+                                            break
+                                        if self.reasoning_loop_recovery == "wrap":
+                                            # local: the thinking is closed the way the budget closes it (the hidden
+                                            # wrap-up, then the answer or the call) - an agent gets its call instead
+                                            # of a reply cut as "length", and no effort sentence is needed
+                                            print(f"[strata] repeated reasoning detected at {n} tokens "
+                                                  f"(coverage={repeat_coverage:.3f}): wrapping up the thinking "
+                                                  "(reasoning_loop_recovery: wrap)", flush=True)
+                                            wrap = loop_wrapped = True   # (after it the parser is past the thinking)
                                             break
                                         if not emb:              # "recover": not for a request with pictures
                                             recover_prompt = focused_recovery_prompt(self.tok, ids, raw_ids)
@@ -3795,7 +3805,7 @@ class Service:
                         extra = self.tok.encode(text, parse_special=True)
                         if max_new - n - len(extra) < 1:
                             break                       # no room left to answer: "length", as without a budget
-                        if wrap:
+                        if wrap and not loop_wrapped:
                             print(f"[strata] thinking budget reached ({thought} tokens): wrapping up the thinking",
                                   flush=True)
                         # local: with hide_reasoning_wrap_up the wrap-up sentence goes to the model but not to the
@@ -5995,8 +6005,8 @@ def main() -> int:
     recovery = cfg.get("reasoning_loop_recovery", False)   # #728: false (default) | "stop" | "recover" (true)
     if recovery is True:
         recovery = "recover"
-    if recovery is not False and recovery not in ("stop", "recover"):
-        raise SystemExit("[strata] config \"reasoning_loop_recovery\" must be false, \"stop\" or \"recover\", "
+    if recovery is not False and recovery not in ("stop", "recover", "wrap"):
+        raise SystemExit("[strata] config \"reasoning_loop_recovery\" must be false, \"stop\", \"recover\" or \"wrap\", "
                          f"not {recovery!r}")
     svc.reasoning_loop_recovery = recovery
 
