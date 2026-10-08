@@ -1,14 +1,17 @@
-# Tuning Strata on a 12 GB laptop: 55 → 105 tok/s
+# Tuning Strata on a 12 GB laptop: 55 → 118 tok/s
 
 This branch (`laptop-12gb`) is the exact engine and server I run every day on a gaming laptop. It is Strata
-v0.1.40.3 plus some community PRs that are not merged upstream, plus a few local changes. Everything here was measured
-on one machine over five days (4–8 October 2026). The 7–8 October work is in "Since 0.1.40.1" below. Most of the local changes are opt-in switches, and with them off
+v0.1.41 plus some community PRs that are not merged upstream, plus a few local changes. Everything here was measured
+on one machine over five days (4–8 October 2026). The 7–8 October work is in "Since 0.1.40.1" and "Since 0.1.40.3" below. Most of the local changes are opt-in switches, and with them off
 the engine behaves like the code it sits on.
 
 ![55 → 105 tok/s on a 12 GB laptop](img/laptop-12gb-55-105.png)
 
+![0.1.41 on the 12 GB laptop, vision on](img/laptop-12gb-0141-poster.png)
+
 **The short version:** on the same 30-question set, generation went from **55 tok/s** (stock 0.1.38 release) to
-**~105 tok/s**. Turkish chat answers went from ~68 to ~94 tok/s. The set still answers 30/30. A long agent task
+**~105 tok/s**, and on 8 October to **~118 tok/s** (engine decode rate, temperature 1.0). Turkish chat answers went
+from ~68 to ~94, then ~100 tok/s. The set still answers 30/30. A long agent task
 (write, build and test an assembly GUI program in opencode) passed 6/6 checks twice with 0 broken tool calls.
 
 The biggest step is CAR (cache-aware routing, from PR #1017). It is **lossy**: it swaps a missed expert for one that
@@ -112,7 +115,8 @@ This is the Strata config the server runs (`strata serve` reads it). Paths are s
     "STRATA_HC_UPMIX": "1",
     "STRATA_PREFILL_CPU_SHARE": "auto",
     "STRATA_PREFILL_STREAM_MIN": "2048",
-    "STRATA_CPU_IQ_ALL_EXACT1": "1"
+    "STRATA_CPU_IQ_ALL_EXACT1": "1",
+    "STRATA_THINK_BAN": "13784,13428,77264,85152,50821,32645,88842,37201"
   },
   "tool_call_recovery": true,
   "fit_max_tokens": true,
@@ -122,7 +126,10 @@ This is the Strata config the server runs (`strata serve` reads it). Paths are s
   "reasoning_budget_by_effort": { "low": 4096, "medium": 8192, "high": 12288, "xhigh": 12288 },
   "effort_position": "start",
   "reasoning_close_retry": true,
-  "hide_reasoning_wrap_up": true
+  "hide_reasoning_wrap_up": true,
+  "reasoning_loop_recovery": "wrap",
+  "vram_elastic": true,
+  "vision": { "exe": "<strata>/engine/strata-vision.exe", "mmproj": "<mmproj BF16>", "gpu": "on_demand" }
 }
 ```
 
@@ -288,6 +295,37 @@ took 1.4 s. The CPU share computes the rarely routed ones from RAM instead. With
 token reads were 20% slower here (PCIe 5.0 x8); 2048 is right for this machine. The CPU share changes the last bits
 (KL +0.01 over the noise floor in a prefill-path teacher-forced test), with no perplexity change.
 
+### Since 0.1.40.3 (8 October)
+
+The engine and server are now **v0.1.41** with all of the changes above merged in. On the same Turkish set, 0.1.41
+measured 10.55 / 10.62 ms per token against 10.37 / 10.48 before (within run-to-run noise).
+
+| change | measure | before | after |
+|---|---|---|---|
+| #1517 (the tier's evictions reach the device table) | `STRATA_ADAPT_CHECKRES=1`, Turkish set: windows with a stale residency table | 180 of 512 (10,871 entries), 1 layer-window computed from a stale activation | 0 / 0 |
+| #1525 (fused prefill kernels, same bits) | prompt read, 8K / 24K tokens | 2,251 / 2,329 tok/s | 2,275 / 2,341 (+0.9% / +0.7%) |
+| live-end checkpoint (#1537) + a reply's own token ids on the next turn + drained tokens kept (#1536) | a tool turn after a thinking-budget wrap-up: tokens read again | 1,379–3,635 (from the turn's start) | 583 / 1,770 (from where the texts differ) |
+| `"vision": {"gpu": "on_demand"}` + `vram_elastic` (local) | vision enabled: expert cache / ms per token / a new image | 2,251 slots / 8.91 / 1.4 s (encoder resident) | 2,883 slots / 8.26 / 3.3 s |
+| `STRATA_THINK_BAN` (NoWait, arXiv 2506.08343; **changes the text**) | 30 questions, effort medium, 2 runs: tokens / wall time | 7,617 / 78.9 s | 6,694 / 72.0 s (−12% / −9%), 30/30 both |
+| `reasoning_loop_recovery: "wrap"` (local mode) | the detector run offline on 2,259 real opencode turns | — | 32 of its 33 triggers are real loops; 4.2% of all thinking would be cut |
+
+Before these, the logs showed ~14% of all prompt-read time going to reading a reply again that the engine still
+held: a thinking-budget wrap-up the client's history does not carry, a few tokens the engine generated past a STOP,
+and pieces the model wrote that BPE would merge (Turkish letters, code). `STRATA_PROMPT_DUMP=<file>` (server) writes
+each request's ids and the engine's tokens, which is how this was found.
+
+NoWait adds a −100 logit bias to Wait / Hmm / Actually / Alternatively (with and without a leading space) while the
+reply is inside its thinking and not writing a call. On my opencode history 92% of the model's text is thinking and
+15% of the thinking is paragraphs that open with those words. The loop mode closes a looping thinking with the
+budget's hidden wrap-up instead of ending the reply, so an agent still gets its call.
+
+Same hour, same tests, temperature 1.0, engine decode rate (the log's `generated ... tok/s`, request average):
+
+| build | Turkish set | 30 questions | answers |
+|---|---|---|---|
+| the 7 October morning build | 97.3 / 94.8 tok/s | 107.9 / 107.0 tok/s | 30/30, 30/30 |
+| this branch (0.1.41) | 98.8 / 101.2 tok/s (+4%) | 119.5 / 118.2 tok/s (+11%) | 30/30, 29/30 (a question this set misses 7 times in 277) |
+
 ### Server: 0.1.40.1 + #1172 + local patches
 
 The engine and the server are the same release (0.1.40.1). The server adds #1172 (tool call recovery, opt-in),
@@ -376,6 +414,11 @@ the same text. The gain is about 2-3% at most and only on copy-heavy work. It is
 |---|---|
 | `--spec 5` / `--spec 6` after CAR | Turkish −11% (spec 5), lower acceptance (spec 6) |
 | `--adapt-swaps 256 / 320` | no clear change |
+| #1548 `STRATA_PCIE_BALANCE=1` (per-layer PCIe count, `--pcie-frac` dropped) | 5–9% slower than the hand-tuned `--pcie-frac 0.2` |
+| CAR per expert ("union" rule: substitute all of an expert's rows or none) | quality the same, speed the same (−12% CPU experts did not shorten the window) |
+| moving cache slots between layers (MoE-CORE) | measured headroom 0.5 points of missed demand: the profile already sizes the layers well |
+| SEAL steering vector (arXiv 2504.07986) through the control-vector path | −10% thinking at a safe scale, no better than NoWait; stronger scales lost questions |
+| `--vram-reserve-mib 300` instead of 700 with on-demand vision | +8% cache slots, no measurable speed change |
 | `--lookup-chain 2 / 4` | agent copy turns −6..−7% (the target case) |
 | `--pcie-frac 0.35` (issue #1216's value on the same GPU) | neutral: the CPU wait drops (5 → 1 ms) but the GPU then waits on PCIe instead (3 → 6.5 ms) |
 | `STRATA_PREFILL_EQUAL=1` (#693) | +2.8% at 18.5K, −1.1% at 29.6K, nothing at 11K |

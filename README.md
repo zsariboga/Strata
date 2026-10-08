@@ -1,7 +1,7 @@
 <h1 align="center">Strata</h1>
 
-> **This fork (`laptop-12gb` branch):** Strata v0.1.40.3 tuned for a 12 GB laptop (RTX 5070 Ti Laptop, 64 GB RAM),
-> 55 → ~105 tok/s on Swift 1.5 IQ3_XXS. The measurements, the config and the credits are in
+> **This fork (`laptop-12gb` branch):** Strata v0.1.41 tuned for a 12 GB laptop (RTX 5070 Ti Laptop, 64 GB RAM),
+> 55 → ~118 tok/s on Swift 1.5 IQ3_XXS, vision on. The measurements, the config and the credits are in
 > [docs/LAPTOP_12GB_TUNING.md](docs/LAPTOP_12GB_TUNING.md). The upstream project is
 > [Niko1221/Strata](https://github.com/Niko1221/Strata).
 
