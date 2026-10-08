@@ -110,6 +110,24 @@ class ReasoningLoopRecovery(unittest.TestCase):
         self.assertLess(events[-1][1]['completion_tokens'], 20000)
         self.assertEqual(events[-1][1]['reasoning_recoveries'], 0)
 
+    def test_wrap_mode_closes_the_thinking_and_answers(self):
+        """local: "wrap" closes the looping thinking as the budget does (wrap-up, </think>) and the model answers -
+        no effort sentence is needed, and the second pass continues the first one's exact prompt."""
+        from serve.server import REASONING_WRAP_UP
+        engine = RecordingEngine(self.tok, [self.loop, 'Complete solution.'])
+        service = Service(engine, self.tok, None)
+        service.reasoning_loop_recovery = "wrap"
+        ids = self.tok.encode('<|im_start|>user\nSolve<|im_end|>\n<|im_start|>assistant\n<think>\n',
+                              parse_special=True)
+        events = list(service.run(ids, True, [], 40000, {}, threading.Event()))
+        self.assertEqual(len(engine.calls), 2)
+        first, second = engine.calls[0][0], engine.calls[1][0]
+        self.assertEqual(second[:len(first)], first)                     # a continuation, not a new prompt
+        self.assertTrue(self.tok.decode(second).endswith(REASONING_WRAP_UP))
+        self.assertLess(events[-1][1]['completion_tokens'], 20000)
+        content = ''.join(e.text or '' for kind, e in events if kind == 'event' and e.kind == 'content')
+        self.assertEqual(content, 'Complete solution.')
+
     def test_disabled_is_one_pass(self):
         engine, events = self.run_case(False)
         self.assertEqual(len(engine.calls), 1)
