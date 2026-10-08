@@ -11557,6 +11557,9 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: cache-aware routing is ON but no verify window ran it "
                                         "(0 groups): it did not substitute anything in this request\n");
             }
+            if (drive.d.tail_experts > 0)   // STRATA_ROUTE_TAIL_SKIP, cumulative
+                std::fprintf(stderr, "strata serve: route tail skip: %lld missed experts skipped (%lld entries) since the "
+                                     "start\n", (long long) drive.d.tail_experts, (long long) drive.d.tail_skipped);
             // the resident RAM mode, cumulative: experts read from experts.bin since the copy was made (what the plain
             // mmap mode reads through the OS file cache, from the SSD when the RAM could not keep it)
             if (src.complement_ready())
