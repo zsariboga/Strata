@@ -1745,7 +1745,12 @@ class Vision:
         self.stopped = True
         self.lock = threading.Lock()
         self.cache: dict[str, tuple[Path, int]] = {}
-        if not lazy:
+        # local: "gpu": "on_demand" - the encoder is not resident: it starts on the GPU only to encode images that are
+        # not cached yet, and stops again (the service frees the VRAM for it first, see Service.encode_images)
+        self.on_demand = cfg.get("gpu") == "on_demand"
+        self.on_demand_reserve_mib = int(cfg.get("on_demand_reserve_mib", 2000))
+        self.on_demand_back_mib = int(cfg.get("on_demand_back_mib", 300))
+        if not lazy and not self.on_demand:
             self._start()
 
     def _start(self):
@@ -1895,6 +1900,16 @@ class Vision:
         out = io.BytesIO()
         im.save(out, format="PNG")
         return out.getvalue()
+
+    def cached(self, sources: list) -> bool:
+        """local: every image of `sources` is encoded already (an on-demand encoder need not start)."""
+        try:
+            keys = [hashlib.sha256(self.normalize(s if isinstance(s, bytes) else self.load(s))).hexdigest()[:32]
+                    for s in sources]
+        except ValueError:
+            return False                                # encode() says why
+        with self.lock:
+            return all(k in self.cache for k in keys)
 
     def encode_all(self, sources: list) -> list[tuple[Path, int]]:
         """encode() for every image of one request: the files of this request's earlier images are never evicted to
@@ -2592,7 +2607,43 @@ class Service:
         return table.get(effort.strip().lower())
 
     def _vision_down(self) -> bool:
+        # local: an on-demand encoder is down on purpose between images (it starts in encode_images)
+        if getattr(self.vision, "on_demand", False):
+            return False
         return self.vision is not None and hasattr(self.vision, "alive") and not self.vision.alive()
+
+    def encode_images(self, images: list) -> list:
+        """The request's images encoded (the caller holds the FIFO: the engine is idle).  local, "gpu": "on_demand":
+        images that are not cached yet start the encoder on the GPU for this request only - an engine started with
+        --vram-elastic first gives back on_demand_reserve_mib of its expert cache, and takes it back afterwards
+        (on_demand_back_mib, or the reserve POST /v1/vram asked for), so the cache is full between images."""
+        v = self.vision
+        if not getattr(v, "on_demand", False) or v.cached(images):
+            return v.encode_all(images) if hasattr(v, "encode_all") else [v.encode(src) for src in images]
+        elastic = (hasattr(self.engine, "vram") and self.loaded()
+                   and bool((getattr(self.engine, "info", {}) or {}).get("vram_elastic")))
+        t0 = time.time()
+        if elastic:
+            try:
+                self.engine.vram(v.on_demand_reserve_mib)
+            except (ValueError, EngineDied) as e:
+                print(f"[strata] the expert cache did not give VRAM back for the image encoder: {e}", flush=True)
+        try:
+            try:
+                v.restart()
+            except RuntimeError as e:                   # the request gets "the image could not be read", not a 500
+                raise ValueError(f"the image encoder did not start on the GPU: {e}") from None
+            return v.encode_all(images)
+        finally:
+            v.unload()
+            if elastic:
+                back = self.vram_reserve if self.vram_reserve is not None else v.on_demand_back_mib
+                try:
+                    out = self.engine.vram(back)
+                    print(f"[strata] image encoder on the GPU for {time.time() - t0:.1f} s; the expert cache is back "
+                          f"to {out.get('expert_slots')} of {out.get('expert_slots_full')} experts", flush=True)
+                except (ValueError, EngineDied) as e:
+                    print(f"[strata] the expert cache did not grow back after the image: {e}", flush=True)
 
     def free_vram_mib(self) -> int | None:
         """Free VRAM on the engine's (first) GPU, from NVML (AMD backend: amdgpu's sysfs files, #301); None when it can't
@@ -3018,7 +3069,7 @@ class Service:
                         if src.startswith(("http://", "https://")):
                             src = fetched[item["source"]] = Vision.download(src)   # outside the FIFO, as in prepare()
                         with self.fifo:          # the encoder takes its turn with the requests (see below)
-                            self.vision.encode(src)
+                            self.encode_images([src])   # local: an on-demand encoder starts here too
                     except (ValueError, OSError) as e:
                         why = str(e)
                 if why is not None:
@@ -3051,8 +3102,7 @@ class Service:
             # "reading the prompt" with CPU and GPU busy, for good (reproduced).  So encoding takes its turn in the
             # same FIFO as the requests.
             with self.fifo:
-                encoded = (self.vision.encode_all(images) if hasattr(self.vision, "encode_all")
-                           else [self.vision.encode(src) for src in images])
+                encoded = self.encode_images(images)
             # one <|image_pad|> per image -> one per image token.  Only the markers the template writes for an image
             # (right after <|vision_start|>) are images: the same text inside a message (an agent reading these docs,
             # #150) is kept as plain text, or it took an image's place and the counts no longer matched.
