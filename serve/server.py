@@ -142,6 +142,9 @@ VISION_START = "<|vision_start|>"
 # broken state that answers one token forever (an issue saw 36,689 tokens of "!"). The config's "repeat_stop_tokens"
 # sets it; 0 turns it off.
 REPEAT_STOP_TOKENS = 256
+# local (opt-in, the config's "pattern_stop_tokens"): a reply whose short pattern (2..16 tokens, "ÇtaÇtaÇta...")
+# repeats this many tokens in a row is ended the same way. Off by default: two alternating tokens can be content.
+PERIOD_STOP_MAX = 16
 # #123: what closes the thinking when it reaches reasoning_budget_tokens (the model's own end-of-thinking tag after it)
 # #1053 (opt-in "reasoning_close_retry": true): a reply that ends on its stop token still inside <think>, with no answer
 # and no call, is continued once with the thinking closed (the same way the budget's wrap-up closes it)
@@ -195,6 +198,11 @@ def focused_recovery_prompt(tok, ids, generated):
     return None
 
 
+
+# local: with tools in the request "give my answer" made agents reply with a plan and end the turn without a tool
+# call (opencode asm task, 2026-10-03); this wording steers the model to act on the plan instead
+REASONING_WRAP_UP_TOOLS = ("\n\nI have thought about this long enough; time to act on the plan now, starting with the "
+                           "first tool call.\n</think>\n\n")
 LOOPBACK_NAMES = ("localhost", "127.0.0.1", "::1")
 CTX_SLACK = 8               # `strata --serve` rejects prompt + max_new + 8 > context: keep the same margin here
 # The live tok/s is a rate over a window, not a mean since the first token: a mean reads ~1/elapsed at the first
@@ -2382,8 +2390,12 @@ def slot_save_dir(value, base: str | None = None) -> str:
 class Service:
     def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "qwen3.8-flash-next",
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
-                 fit_max_tokens: bool = False):
+                 fit_max_tokens: bool = False, prompt_reuse: bool = True):
         self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
+        self.prompt_encoder = None
+        if prompt_reuse and os.environ.get("STRATA_PROMPT_REUSE", "1") != "0" and callable(getattr(tokenizer, "encode_marked", None)):
+            from strata_tokenizer import PromptEncoder
+            self.prompt_encoder = PromptEncoder(tokenizer)
         self.literals = literal_tags(getattr(tokenizer, "control_tokens", ()))   # texts that stay text inside a message
         self.fit_max_tokens = fit_max_tokens          # --fit-max-tokens: clamp the output cap instead of 400
         self.aliases: list[str] = []                  # #297: other names of the model (the config's `aliases`)
@@ -2444,7 +2456,10 @@ class Service:
         self.vram_reserve = None                         # #533: the last POST /v1/vram reserve (None: the start's)
         self.reasoning_loop_recovery = False
         self.reasoning_budget_tokens = 0                 # #123: the config's default thinking budget (0: none)
+        self.reasoning_budget_by_effort = {}             # yerel yama: efor -> dusunme butcesi (config)
+        self.hide_reasoning_wrap_up = False              # local: keep the budget's wrap-up sentence out of replies
         self.repeat_stop_tokens = REPEAT_STOP_TOKENS     # #606: one token this many times in a row ends a reply (0: off)
+        self.pattern_stop_tokens = 0                     # local: a 2-16 token pattern this many tokens in a row (0: off)
         self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
         self.tool_call_recovery = False                   # opt-in: tool calls in forms next to the template's
         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
@@ -2553,12 +2568,28 @@ class Service:
         anything that is not a whole number."""
         value = (req or {}).get("reasoning_budget_tokens") if isinstance(req, dict) else None
         if value is None:
+            value = self.effort_budget(req)          # yerel yama: eforun butcesi (config reasoning_budget_by_effort)
+        if value is None:
             value = self.reasoning_budget_tokens
         if isinstance(value, float) and value.is_integer():
             value = int(value)
         if isinstance(value, bool) or not isinstance(value, int):
             raise ValueError(f"reasoning_budget_tokens={value!r}: expected a whole number of tokens (0: no budget)")
         return value if value > 0 else None
+
+    def effort_budget(self, req) -> int | None:
+        """Yerel yama: istegin eforu (reasoning_effort, reasoning.effort ya da chat_template_kwargs.reasoning_effort)
+        config'teki reasoning_budget_by_effort tablosunda varsa onun butcesi, yoksa None (config'in tek butcesi gecer).
+        Swift xhigh ortalama ~7.8K token dusunur; tek 4096'lik butce xhigh'i yarida keser."""
+        table = getattr(self, "reasoning_budget_by_effort", None) or {}
+        if not table or not isinstance(req, dict):
+            return None
+        ctk = req.get("chat_template_kwargs") if isinstance(req.get("chat_template_kwargs"), dict) else {}
+        reasoning = req.get("reasoning") if isinstance(req.get("reasoning"), dict) else {}
+        effort = req.get("reasoning_effort") or reasoning.get("effort") or ctk.get("reasoning_effort")
+        if not isinstance(effort, str):
+            return None
+        return table.get(effort.strip().lower())
 
     def _vision_down(self) -> bool:
         return self.vision is not None and hasattr(self.vision, "alive") and not self.vision.alive()
@@ -2961,7 +2992,8 @@ class Service:
         marked, marked_tools, changed = mark_think_literals(messages, tools, self.literals)
         prompt = self.render_prompt(marked, marked_tools, kwargs)
         if not changed:
-            return self.tok.encode(prompt, parse_special=True)
+            return (self.prompt_encoder.encode(prompt) if self.prompt_encoder is not None
+                    else self.tok.encode(prompt, parse_special=True))
         prompt, plain = unmark_think_literals(prompt, self.literals)
         return self.tok.encode(prompt, parse_special=True, plain=plain)
 
@@ -3203,6 +3235,9 @@ class Service:
         parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True, recover=self.tool_call_recovery)
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         run_tok, run_len, repeated = None, 0, False     # #606: the current run of one repeated token
+        # local: the same for a short pattern (pattern_stop_tokens): run_p[p] counts the tokens in a row that equal
+        # the token p before them
+        run_p, period_hit = [0] * (PERIOD_STOP_MAX + 1), 0
         thinking_n = 0                                  # tokens written while thinking (Responses' reasoning_tokens)
         stop_list = stop_strings(sampling)
         stops = StopMatcher(stop_list) if stop_list else None
@@ -3274,6 +3309,10 @@ class Service:
                     before = getattr(self.engine, "last", None)
                     last_print = time.time()
                     prompt, thought = ids, 0            # thought: the reasoning tokens so far (the budget's count)
+                    # local: a reply that ends inside a tool call it is writing (the call is cut), or that closes its
+                    # thinking and ends with nothing after it, gets its stop token dropped and goes on once
+                    stop_resume = os.environ.get("STRATA_STOP_MID_CALL", "1") != "0"
+                    acted = False                   # local: any answer text or tool call in this reply yet
                     for ev in opening:
                         yield "event", ev
                     while True:
@@ -3283,6 +3322,7 @@ class Service:
                         recover_prompt = None
                         seg, wrap, leaving = [], False, False   # this pass's tokens; the budget is reached; closed
                         opens = False                   # the thinking is over: write the forced call's opening
+                        resume_on = False               # local: stopped mid-call / with nothing after the thinking
                         try:
                             for t in gen:
                                 if t is None:               # heartbeat while the engine is quiet
@@ -3296,6 +3336,11 @@ class Service:
                                 if t in self.stop_ids:
                                     finish = "stop"
                                     raw_ids.append(t)
+                                    if stop_resume and not detok.pending() and (
+                                            (parser.state == "call" and getattr(parser, "ss", None) != "done") or
+                                            (parser.state == "content" and getattr(parser, "lead", False)
+                                             and not parser.buf and not acted)):
+                                        resume_on = True
                                     break
                                 raw_ids.append(t)
                                 seg.append(t)
@@ -3305,10 +3350,22 @@ class Service:
                                 if self.repeat_stop_tokens and run_len >= self.repeat_stop_tokens:
                                     repeated = True     # #606: a degenerate output, not an answer: end it here
                                     break
+                                if self.pattern_stop_tokens:
+                                    m = len(raw_ids)
+                                    for p in range(2, PERIOD_STOP_MAX + 1):
+                                        run_p[p] = run_p[p] + 1 if m > p and raw_ids[m - 1 - p] == t else 0
+                                        if not period_hit and run_p[p] >= self.pattern_stop_tokens:
+                                            period_hit = p
+                                    if period_hit:
+                                        repeated = True     # local: a short pattern looping, as #606
+                                        break
                                 piece = detok.push(t)
                                 tail = (tail + piece)[-2:]
                                 evs = cut(parser.feed(piece))
                                 self._note(n, evs, st, rate)
+                                acted = acted or any(ev.kind in ("tool_start", "tool_call") or
+                                                     (ev.kind == "content" and (ev.text or "").strip())
+                                                     for ev in evs)
                                 last_print = self._progress(last_print, st=st)
                                 for ev in evs:
                                     if self.reasoning_loop_recovery and ev.kind == "reasoning":
@@ -3368,6 +3425,16 @@ class Service:
                             segment_done = getattr(self.engine, "last", None)
                             if segment_done is not None and segment_done is not segment_before:
                                 segments.append(dict(segment_done))
+                        if resume_on and not cancel.is_set() and n < max_new:
+                            stop_resume = False         # once per reply
+                            if raw_ids and raw_ids[-1] in self.stop_ids:
+                                raw_ids.pop()           # the stop token is not part of the reply
+                            print("[strata] the reply ended " + ("inside a tool call" if parser.state == "call" else
+                                  "right after its thinking with no answer") + ": dropping the stop and going on once",
+                                  flush=True)
+                            finish = "length"
+                            prompt = prompt + seg
+                            continue
                         if recover_prompt is not None and not cancel.is_set() and n < max_new:
                             recovery_count += 1
                             # Only the two settings that keep the same words coming are raised (temperature to at
@@ -3416,9 +3483,12 @@ class Service:
                         # was generated plus the wrap-up, so the engine continues from the prefix it already holds.
                         # A forced call (tool_choice) is opened the same way: after the wrap-up, or where the
                         # thinking ended, after the blank line the template puts before a call.
+                        # local: with tools the wrap-up steers the model to its first tool call (REASONING_WRAP_UP_TOOLS)
+                        wrap_up = ""
                         if wrap:
                             budget = None
-                            text = REASONING_WRAP_UP + (force or "")
+                            wrap_up = REASONING_WRAP_UP_TOOLS if tools else REASONING_WRAP_UP
+                            text = wrap_up + (force or "")
                         else:
                             text = "\n" * (2 - (len(tail) - len(tail.rstrip("\n")))) + force
                         force = None
@@ -3428,11 +3498,18 @@ class Service:
                         if wrap:
                             print(f"[strata] thinking budget reached ({thought} tokens): wrapping up the thinking",
                                   flush=True)
-                        for t in extra:
+                        # local: with hide_reasoning_wrap_up the wrap-up sentence goes to the model but not to the
+                        # client, so agent clients that send the thinking back do not teach the model to repeat it
+                        hidden = len(self.tok.encode(wrap_up.split("</think>")[0], parse_special=True)) \
+                            if wrap and self.hide_reasoning_wrap_up else 0
+                        for i, t in enumerate(extra):
                             n += 1
                             raw_ids.append(t)
                             thinking_n += parser.state in ("reasoning", "rcall")
-                            evs = cut(parser.feed(detok.push(t)))
+                            piece = detok.push(t)
+                            if i < hidden:
+                                continue
+                            evs = cut(parser.feed(piece))
                             self._note(n, evs, st, rate)
                             for ev in evs:
                                 yield "event", ev
@@ -3446,6 +3523,11 @@ class Service:
                         print(f"[strata] the thinking repeated the same passages (coverage={repeat_coverage:.3f}) at "
                               f"{n} tokens: ended as \"length\" (reasoning_loop_recovery: \"stop\" in "
                               "strata-<model>.json; remove it to turn this off)", flush=True)
+                    elif repeated and period_hit:
+                        pat = self.tok.decode(raw_ids[-period_hit:])
+                        print(f"[strata] the reply repeated a {period_hit}-token pattern ({pat!r}) "
+                              f"{run_p[period_hit]} tokens in a row: ended as \"length\" (pattern_stop_tokens in "
+                              "strata-<model>.json; 0 or no key turns this off)", flush=True)
                     elif repeated:
                         print(f"[strata] the reply repeated one token ({self.tok.decode([run_tok])!r}) "
                               f"{run_len} times in a row: ended as \"length\" (repeat_stop_tokens in "
@@ -5518,6 +5600,10 @@ def main() -> int:
     if isinstance(rs, bool) or not isinstance(rs, int) or rs < 0:
         raise SystemExit(f"[strata] config \"repeat_stop_tokens\" must be a whole number >= 0 (0 = off), not {rs!r}")
     svc.repeat_stop_tokens = rs
+    ps = cfg.get("pattern_stop_tokens", 0)                  # local: opt-in short-pattern loop stop
+    if isinstance(ps, bool) or not isinstance(ps, int) or ps < 0:
+        raise SystemExit(f"[strata] config \"pattern_stop_tokens\" must be a whole number >= 0 (0 = off), not {ps!r}")
+    svc.pattern_stop_tokens = ps
     svc.effort_end = bool(effort_end)                   # #458: "effort_position": "end" with an engine that has it
     if cfg.get("reasoning_budget_tokens") is not None:  # #123: a default thinking budget for every request
         try:
@@ -5535,6 +5621,16 @@ def main() -> int:
         raise SystemExit("[strata] config \"reasoning_loop_recovery\" must be false, \"stop\" or \"recover\", "
                          f"not {recovery!r}")
     svc.reasoning_loop_recovery = recovery
+
+    by_effort = cfg.get("reasoning_budget_by_effort")    # yerel yama: {"low": 4096, "medium": 8192, "xhigh": 16384}
+    if by_effort is not None:
+        if not isinstance(by_effort, dict) or not all(
+                isinstance(k, str) and isinstance(v, int) and not isinstance(v, bool) for k, v in by_effort.items()):
+            raise SystemExit("[strata] config reasoning_budget_by_effort: expected {\"low\": 4096, ...} (whole numbers)")
+        svc.reasoning_budget_by_effort = {k.strip().lower(): v for k, v in by_effort.items()}
+        print("[strata] thinking budget by effort: " + ", ".join(f"{k} {v}" for k, v in svc.reasoning_budget_by_effort.items()),
+              flush=True)
+    svc.hide_reasoning_wrap_up = bool(cfg.get("hide_reasoning_wrap_up", False))
     svc.gpu_index = (gpu_list(cfg) or [0])[0]           # the Monitor reads the card the engine runs on (issue #51)
     svc.gpu_indices = gpu_list(cfg)                     # ... or every card of a layer split (issue #112)
     svc.backend = cfg.get("backend")                    # "hip": the AMD cards' readings come from sysfs (#301)

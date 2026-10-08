@@ -1206,6 +1206,7 @@ class UnfinishedToolCall(unittest.TestCase):
             httpd.server_close()
         return out
 
+    @mock.patch.dict(os.environ, {"STRATA_STOP_MID_CALL": "0"})   # local: the turn ends there for good
     def test_a_cut_call(self):
         cut = '{"path":"notes.txt","content":"first half of the fi'
         self.assertEqual(self.answers(self.CUT), {
@@ -1962,6 +1963,37 @@ class RepeatStop(unittest.TestCase):
         self.assertEqual((done["finish"], done["completion_tokens"]), ("stop", 1001))
         self.assertNotIn("repeated one token", log)
         done, _ = self.run_reply("ab" * 400, limit=8)       # alternating tokens are not one run
+        self.assertEqual(done["finish"], "stop")
+
+
+class PatternStop(unittest.TestCase):
+    """local: a 2-16 token pattern repeated pattern_stop_tokens tokens in a row ends the reply as "length"; off by
+    default (0)."""
+
+    def run_reply(self, script, limit):
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, script, max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        svc.pattern_stop_tokens = limit
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            done = [x for kind, x in svc.run(tok.encode("hi"), False, None, 3000, {}, threading.Event())
+                    if kind == "done"][0]
+        return done, out.getvalue()
+
+    def test_a_looping_pattern_is_ended(self):
+        done, log = self.run_reply("ok " + "Cta" * 400 + " never", 512)
+        self.assertEqual(done["finish"], "length")
+        self.assertEqual(done["completion_tokens"], 3 + 3 + 512)     # the first 3 open the pattern, then 512 repeat it
+        self.assertIn("repeated a 3-token pattern ('", log)
+        done, _ = self.run_reply("ok " + "ab" * 400, 512)
+        self.assertEqual(done["finish"], "length")
+
+    def test_off_and_short_runs(self):
+        done, log = self.run_reply("Cta" * 400, 0)                   # the default: off
+        self.assertEqual(done["finish"], "stop")
+        self.assertNotIn("pattern", log)
+        done, _ = self.run_reply("".join(f"| {i} | b |\n" for i in range(100)) + "end", 512)   # rows that differ
+        self.assertEqual(done["finish"], "stop")
+        done, _ = self.run_reply("ab" * 200 + " done", 512)          # 398 in a row: under the limit
         self.assertEqual(done["finish"], "stop")
 
 
@@ -3228,6 +3260,18 @@ class ThinkingBudget(unittest.TestCase):
         msg = b["choices"][0]["message"]
         self.assertEqual((msg["content"], b["choices"][0]["finish_reason"]), ("The ", "stop"))
 
+    def test_hidden_wrap_up_reaches_the_model_not_the_client(self):
+        from serve.server import REASONING_WRAP_UP
+        self.svc.hide_reasoning_wrap_up = True
+        code, b = self.openai(reasoning_budget_tokens=20)
+        self.assertEqual(code, 200, b)
+        msg = b["choices"][0]["message"]
+        self.assertEqual(msg["reasoning_content"], ThinkingEngine.THOUGHT[:20])
+        self.assertEqual(msg["content"], ThinkingEngine.ANSWER)
+        first, second = self.engine.prompts
+        extra = self.tok.encode(REASONING_WRAP_UP, parse_special=True)
+        self.assertEqual(second, first + self.tok.encode(ThinkingEngine.THOUGHT[:20]) + extra)
+
     def test_anthropic_stream(self):
         from serve.server import REASONING_WRAP_UP
         code, raw = self.post("/v1/messages", {"model": "m", "max_tokens": 400, "stream": True,
@@ -3271,6 +3315,21 @@ class ThinkingBudget(unittest.TestCase):
             with self.assertRaises(ValueError, msg=repr(bad)):
                 self.svc.set_shared({"reasoning_budget_tokens": bad})
         self.assertEqual(self.svc.set_shared({"reasoning_budget_tokens": 0}), {"reasoning_budget_tokens": 0})
+
+    def test_the_budget_follows_the_effort(self):
+        # yerel yama: reasoning_budget_by_effort - the request's effort picks the budget; an explicit budget still wins
+        self.svc.reasoning_budget_tokens = 10_000
+        self.svc.reasoning_budget_by_effort = {"low": 20, "medium": 10_000}
+        code, b = self.openai(reasoning_effort="low")
+        self.assertEqual(code, 200, b)
+        self.assertTrue(b["choices"][0]["message"]["reasoning_content"].startswith(ThinkingEngine.THOUGHT[:20] + "\n"))
+        self.assertEqual(len(self.engine.prompts), 2)
+        code, b = self.openai(reasoning_effort="medium")
+        self.assertEqual(b["choices"][0]["message"]["reasoning_content"], ThinkingEngine.THOUGHT)
+        code, b = self.openai(reasoning_effort="low", reasoning_budget_tokens=10_000)
+        self.assertEqual(b["choices"][0]["message"]["reasoning_content"], ThinkingEngine.THOUGHT)
+        self.assertIsNone(self.svc.effort_budget({"reasoning_effort": "xhigh"}))     # not in the table: config's
+        self.assertEqual(self.svc.effort_budget({"chat_template_kwargs": {"reasoning_effort": "LOW"}}), 20)
 
     def test_without_thinking_there_is_nothing_to_limit(self):
         self.engine.THOUGHT = ""
@@ -3415,7 +3474,8 @@ class ForcedToolChoice(unittest.TestCase):
                     self.assertTrue(self.tok.decode(self.engine.prompts[0]).endswith("</think>\n\n" + opening))
 
     def test_the_budget_wrap_up_opens_the_call(self):
-        from serve.server import REASONING_WRAP_UP
+        # local: with tools the wrap-up is REASONING_WRAP_UP_TOOLS ("act on the plan ... first tool call")
+        from serve.server import REASONING_WRAP_UP_TOOLS as REASONING_WRAP_UP
         code, b = self.openai(tool_choice="required", reasoning_budget_tokens=20)
         finish, calls, reasoning = self.call_of(code, b, False)
         self.assertEqual((finish, calls), ("tool_calls", [("search", {"q": "2+2"})]))
@@ -4708,6 +4768,47 @@ class ClaudeCodeBillingStamp(unittest.TestCase):
                                                          "tools": tools}))
         self.assertEqual(ids[1][:len(first) - 8], first[:len(first) - 8])   # all but the generation header
 
+class EmptyAssistantTurns(unittest.TestCase):
+    """#843: empty assistant turns (no text, no tool calls) are left out of the prompt; the model imitated them and
+    stopped calling tools.  The last message stays, and STRATA_KEEP_EMPTY_TURNS=1 keeps the old behaviour."""
+
+    TPL = ChatTemplate(ROOT / "serve/chat_template.jinja")
+    CHAT = [{"role": "user", "content": "haz un ls"},
+            {"role": "assistant", "content": "", "reasoning_content": "The user wants ls."},
+            {"role": "user", "content": "haz un ls"},
+            {"role": "assistant", "content": [{"type": "text", "text": "  "}]},
+            {"role": "user", "content": "haz un ls"},
+            {"role": "assistant", "content": None, "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "bash", "arguments": {"command": "ls"}}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "a.txt"},
+            {"role": "assistant", "content": "a.txt"},
+            {"role": "user", "content": "haz un ls"}]
+
+    def render(self, messages):
+        return self.TPL.render(messages, add_generation_prompt=True)
+
+    def setUp(self):
+        patch = mock.patch.dict(os.environ)
+        patch.start()
+        self.addCleanup(patch.stop)
+        os.environ.pop("STRATA_KEEP_EMPTY_TURNS", None)
+
+    def test_empty_turns_are_skipped(self):
+        kept = [m for i, m in enumerate(self.CHAT) if i not in (1, 3)]
+        self.assertEqual(self.render(self.CHAT), self.render(kept))
+        self.assertNotIn("The user wants ls.", self.render(self.CHAT))
+        self.assertIn("<tool_call>", self.render(self.CHAT))                # a turn with only a tool call stays
+        self.assertIn("a.txt", self.render(self.CHAT))
+
+    def test_the_last_message_stays(self):
+        chat = self.CHAT[:2]                                                 # ends with an empty assistant turn
+        self.assertNotEqual(self.render(chat), self.render(chat[:1]))
+
+    def test_opt_out(self):
+        os.environ["STRATA_KEEP_EMPTY_TURNS"] = "1"
+        kept = [m for i, m in enumerate(self.CHAT) if i not in (1, 3)]
+        self.assertNotEqual(self.render(self.CHAT), self.render(kept))
+
 
 class UntimedReads(unittest.TestCase):
     """#1317: a read of the engine's READY line or of the image encoder's pipe that never returns held the request
@@ -4792,6 +4893,90 @@ class UntimedReads(unittest.TestCase):
         v.proc = SimpleNamespace(stdout=SimpleNamespace(readline=lambda: "OK 7 1 1 1\n"))
         self.assertEqual(v._readline(5.0, "x"), "OK 7 1 1 1\n")
 
+
+class CutCaller(ThinkingEngine):
+    """local: thinks, closes the thinking and starts a call, but ends its turn with <|im_end|> in the middle of the
+    call's arguments; a prompt that ends inside that call gets the rest of it.  `silent`: ends right after </think>
+    instead (no answer, no call).  `always`: it stops the same way again."""
+    HEAD = "<tool_call>\n<function=search>\n<parameter=q>\n2+"
+    REST = "2\n</parameter>\n</function>\n</tool_call>"
+    always = False
+    silent = False
+
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        self.prompts.append(list(ids))
+        prompt = self.tok.decode(ids)
+        if prompt.endswith(self.HEAD) and not self.always:
+            text = self.REST
+        elif prompt.endswith("</think>\n\n") and self.silent and not self.always:
+            text = self.ANSWER
+        elif prompt.endswith(self.HEAD) or prompt.endswith("</think>\n\n"):
+            text = ""
+        else:
+            text = self.THOUGHT + "</think>\n\n" + ("" if self.silent else self.HEAD)
+        for t in (self.tok.encode(text) + self.tok.encode("<|im_end|>", parse_special=True))[:max_new]:
+            if cancel.is_set():
+                return
+            yield t
+
+
+class StopMidCall(unittest.TestCase):
+    """local: a reply that ends in the middle of a tool call (the call is cut) or right after its thinking with
+    nothing written gets its stop token dropped and goes on once.  STRATA_STOP_MID_CALL=0 keeps the old reply."""
+    post = ThinkingBudget.post
+    TOOLS = [{"type": "function", "function": {"name": "search", "description": "search the web",
+                                               "parameters": {"type": "object",
+                                                              "properties": {"q": {"type": "string"}},
+                                                              "required": ["q"]}}}]
+
+    def setUp(self):
+        self.tok = ByteTokenizer()
+        self.engine = CutCaller(self.tok)
+        self.svc = Service(self.engine, self.tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        self.httpd = serve(self.svc, port=0)
+        self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+        patch = mock.patch.dict(os.environ)
+        patch.start()
+        self.addCleanup(patch.stop)
+        os.environ.pop("STRATA_STOP_MID_CALL", None)
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+    def openai(self, **extra):
+        return self.post("/v1/chat/completions", {"model": "m", "messages": [{"role": "user", "content": "2+2?"}],
+                                                  "max_tokens": 600, "tools": self.TOOLS, **extra})
+
+    def test_a_call_cut_by_the_stop_token_is_finished(self):
+        code, b = self.openai()
+        self.assertEqual(code, 200, b)
+        msg = b["choices"][0]["message"]
+        self.assertEqual(b["choices"][0]["finish_reason"], "tool_calls", b)
+        self.assertEqual([(c["function"]["name"], json.loads(c["function"]["arguments"])) for c in msg["tool_calls"]],
+                         [("search", {"q": "2+2"})])
+        first, second = self.engine.prompts
+        self.assertEqual(second, first + self.tok.encode(CutCaller.THOUGHT + "</think>\n\n" + CutCaller.HEAD))
+
+    def test_nothing_after_the_thinking_goes_on_once(self):
+        self.engine.silent = True
+        code, b = self.openai()
+        self.assertEqual(code, 200, b)
+        self.assertEqual(b["choices"][0]["message"]["content"], CutCaller.ANSWER)
+        self.assertEqual(len(self.engine.prompts), 2)
+
+    def test_only_once(self):
+        self.engine.always = True
+        code, b = self.openai()
+        self.assertEqual(code, 200, b)
+        self.assertEqual(len(self.engine.prompts), 2)       # one more pass, then the reply ends as it is
+
+    def test_opt_out_keeps_the_cut_reply(self):
+        os.environ["STRATA_STOP_MID_CALL"] = "0"
+        code, b = self.openai()
+        self.assertEqual(code, 200, b)
+        self.assertEqual(len(self.engine.prompts), 1)
+        self.assertFalse(b["choices"][0]["message"].get("tool_calls"))
 
 if __name__ == "__main__":
     unittest.main()
