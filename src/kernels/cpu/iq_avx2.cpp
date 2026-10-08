@@ -453,10 +453,6 @@ void q8k_quant_avx2(const float* x, void* vy, int64_t k) {
     }
 }
 
-bool iq256_supported(int type) noexcept {
-    return type == 16 || type == 17 || type == 18 || type == 21 || type == 22 || type == 23;
-}
-
 void iq256_gu_rows_exact_one(int type, const uint8_t* blob, size_t gu_row, size_t up_off, int n,
                              const void* act, float* ff, int r0, int r1) {
     const auto* y = (const block_q8_K*) act;
