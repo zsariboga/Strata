@@ -312,7 +312,7 @@ ConversationRestore PrefixStore::restore(uint64_t key, SessionState& ss, const M
     size_t bytes = m.live.bytes() + m.kv.size() * sizeof(ConversationKv);
     for (const auto& z : sizes) for (size_t n : z) bytes += n;
     // the RAM tier when it has room and the machine has the memory; else straight from the file
-    if (trim_ram(bytes) && conversation_memory_admit(conversation_available_memory(), bytes, o_.min_free)) {
+    if (trim_ram(bytes) && conversation_memory_admit(available_host_bytes(), bytes, o_.min_free)) {
         try {
             auto image = std::make_shared<SavedConversation>(std::move(m));
             bool ok = true;
