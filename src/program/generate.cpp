@@ -1,3 +1,4 @@
+#include "strata/kernels/route_prior.hpp"
 #include "strata/core/logit_bias.hpp"
 // src/program/generate.cpp - P2.S6: `strata generate`.
 //
@@ -163,6 +164,43 @@ void think_ban_init() {
     think_ban().bias = bias;
     std::fprintf(stderr, "strata serve: STRATA_THINK_BAN: %zu token ids get %.1f inside the thinking (vocab %d)\n",
                  ids.size(), bias, vocab);
+}
+// local fixes for STRATA_ROUTE_PRIOR (see route_prior.cu): STRATA_ROUTE_PRIOR_SCOPE = answer | think | all puts the
+// bonus behind the same structure gate as CAR (never inside <tool_call> or a ``` fence, nor in a window whose drafts
+// cross a boundary marker): `host` is the mapped lambda the route kernel reads per window, 0 = the router's own picks.
+// STRATA_ROUTE_PRIOR_PROTECT=N keeps the router's first N picks.  Both unset: PRIOR as before.
+struct PriorGate { float* host = nullptr; float lambda = 0.0f; int scope = -1; };
+PriorGate& prior_gate() { static PriorGate g; return g; }
+void prior_gate_init() {
+    const char* lv = std::getenv("STRATA_ROUTE_PRIOR");
+    const float lambda = lv ? (float) std::atof(lv) : 0.0f;
+    if (!(lambda > 0.0f)) return;
+    const char* pv = std::getenv("STRATA_ROUTE_PRIOR_PROTECT");
+    const int protect = pv ? std::atoi(pv) : 0;
+    const char* kv = std::getenv("STRATA_ROUTE_PRIOR_KEEP_P");
+    const float keep_p = kv ? (float) std::atof(kv) : 0.0f;
+    const char* sv = std::getenv("STRATA_ROUTE_PRIOR_SCOPE");
+    const std::string sc = sv != nullptr ? sv : "";
+    const int scope = sc == "all" ? 2 : sc == "answer" ? 1 : sc == "think" ? 0 : -1;
+    float* d_gate = nullptr;
+    if (scope >= 0) {
+        float* h = nullptr;
+        if (cudaHostAlloc((void**) &h, sizeof(float), cudaHostAllocMapped) != cudaSuccess ||
+            cudaHostGetDevicePointer((void**) &d_gate, h, 0) != cudaSuccess) {
+            std::fprintf(stderr, "strata serve: STRATA_ROUTE_PRIOR_SCOPE could not be set up; PRIOR everywhere
+");
+            d_gate = nullptr;
+        } else {
+            *(volatile float*) h = 0.0f;
+            prior_gate().host = h;
+            prior_gate().lambda = lambda;
+            prior_gate().scope = scope;
+        }
+    }
+    strata::kernels::route_prior_configure(d_gate, protect, keep_p);
+    std::fprintf(stderr, "strata serve: STRATA_ROUTE_PRIOR %.2f, scope %s, router's first %d picks protected, keep_p %.2f
+", lambda,
+                 scope == 2 ? "all (gated)" : scope == 1 ? "answer" : scope == 0 ? "think" : "everywhere (no gate)", protect, keep_p);
 }
 // Windows' WDDM driver model: native Windows, or WSL2 (its GPU goes through /dev/dxg to the Windows driver).  There,
 // pinning a large arena into two CUDA contexts leaves WDDM refusing every later allocation (the 5080 + 3090 rig);
@@ -7651,6 +7689,7 @@ int main(int argc, char** argv) {
         ver.set_remote_expert_opt(remote_opt.get());
         set_car_on(ver);
         think_ban_init();
+        prior_gate_init();
         if (batch_mtp) ver.set_batch_graph_limit(64);   // --batch-mtp only: slot rotation makes many layouts (LRU); 0.1.39 keeps all
         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr,
                       batch_mtp ? strata::kernels::kVerifyMaxT : std::max(o.spec, o.batch), err) ||
@@ -10828,6 +10867,12 @@ int main(int argc, char** argv) {
                     drive.d.failed = false;
                     drive.d.car_token_index = q;   // the warmup window counts the session's positions
                     drive.d.car_open = false;      // local: never on a prompt being read (its K/V is the prompt's)
+                    if (prior_gate().host != nullptr) {
+                        // local STRATA_ROUTE_PRIOR_SCOPE: off on a prompt being read, as CAR; the measurement switch
+                        // STRATA_ROUTE_PRIOR_ON_PROMPT=1 keeps it on (teacher-forced KL of the bonus itself)
+                        static const bool on_prompt = [] { const char* v = std::getenv("STRATA_ROUTE_PRIOR_ON_PROMPT"); return v != nullptr && v[0] == '1'; }();
+                        *(volatile float*) prior_gate().host = on_prompt ? prior_gate().lambda : 0.0f;
+                    }
                     if (!ver.run(T, win.data(), q, win_pool_fn, win_pool_user, outw.data(), e) || drive.d.failed) {
                         if (drive.d.failed && drive.d.fail) e = drive.d.fail;
                         return false;
@@ -12107,6 +12152,19 @@ int main(int argc, char** argv) {
                                 w == 71093 || w == 52451) { car_open = false; break; }
                         }
                     drive.d.car_open = car_open;
+                    // local STRATA_ROUTE_PRIOR_SCOPE: the same gate as CAR, with its own scope
+                    if (prior_gate().host != nullptr) {
+                        const int ps = prior_gate().scope;
+                        bool prior_open = !typ_st.loop &&
+                                          (ps == 2 || (ps == 1 ? (!typ_st.tool && !typ_st.fence) : (typ_st.think && !typ_st.tool)));
+                        if (prior_open && ps != 2)
+                            for (int t = 1; t < T; ++t) {
+                                const int32_t w = window[(size_t) t];
+                                if (w == 248068 || w == 248069 || w == 248058 || w == 248059 || w == 248046 ||
+                                    w == 71093 || w == 52451) { prior_open = false; break; }
+                            }
+                        *(volatile float*) prior_gate().host = prior_open ? prior_gate().lambda : 0.0f;
+                    }
                     // local (STRATA_THINK_BAN): the reflection openers lose their weight inside the thinking only
                     if (think_ban().host != nullptr)
                         *(volatile float*) think_ban().host =

@@ -28,7 +28,12 @@ __device__ __forceinline__ float wsum(float v) {
 
 // one warp per token; 512 experts = 16 values per lane (as the native router)
 __global__ void route_prior_k(const float* __restrict__ logits, const int32_t* __restrict__ res, float lambda,
-                                  int32_t* __restrict__ ids, float* __restrict__ weights) {
+                                  int32_t* __restrict__ ids, float* __restrict__ weights, const float* gate, int protect,
+                                  float keep_p) {
+    if (gate != nullptr) {   // local STRATA_ROUTE_PRIOR_SCOPE: this window's lambda; 0 = out of scope, the native top-10 stands
+        lambda = *(volatile const float*) gate;
+        if (!(lambda > 0.0f)) return;
+    }
     const float* lg = logits + (size_t) blockIdx.x * 512;
     int32_t* id = ids + (size_t) blockIdx.x * 10;
     float* w = weights + (size_t) blockIdx.x * 10;
@@ -48,18 +53,42 @@ __global__ void route_prior_k(const float* __restrict__ logits, const int32_t* _
     }
     (void) wsum(sum);
     float sel_p = 0.0f, sel_sum = 0.0f;
+    // local fixes: the router's own picks come first while they are protected - its first `protect` ranks
+    // (STRATA_ROUTE_PRIOR_PROTECT) and every expert whose probability is at least `keep_p` of the top one's
+    // (STRATA_ROUTE_PRIOR_KEEP_P; p is exp(logit - max), so the top one is 1.0); the rest by the biased score.
+    // A taken expert has s = -FLT_MAX in either phase.
+    bool own_phase = protect > 0 || keep_p > 0.0f;
     for (int rank = 0; rank < 10; ++rank) {
         float best = -FLT_MAX, bp = 0.0f;
         int be = 1 << 30;
+        bool picked = false;
+        if (own_phase) {
 #pragma unroll
-        for (int i = 0; i < 16; ++i)
-            if (s[i] > best) { best = s[i]; be = lane + 32 * i; bp = p[i]; }
+            for (int i = 0; i < 16; ++i) {
+                const float key = s[i] == -FLT_MAX ? -FLT_MAX : p[i];
+                if (key > best) { best = key; be = lane + 32 * i; bp = p[i]; }
+            }
 #pragma unroll
-        for (int m = 16; m; m >>= 1) {
-            const float ob = __shfl_xor_sync(0xffffffffu, best, m, 32);
-            const int oe = __shfl_xor_sync(0xffffffffu, be, m, 32);
-            const float op = __shfl_xor_sync(0xffffffffu, bp, m, 32);
-            if (ob > best || (ob == best && oe < be)) { best = ob; be = oe; bp = op; }
+            for (int m = 16; m; m >>= 1) {
+                const float ob = __shfl_xor_sync(0xffffffffu, best, m, 32);
+                const int oe = __shfl_xor_sync(0xffffffffu, be, m, 32);
+                const float op = __shfl_xor_sync(0xffffffffu, bp, m, 32);
+                if (ob > best || (ob == best && oe < be)) { best = ob; be = oe; bp = op; }
+            }
+            if (rank < protect || (keep_p > 0.0f && bp >= keep_p)) picked = true;
+            else { own_phase = false; best = -FLT_MAX; bp = 0.0f; be = 1 << 30; }   // the same on every lane
+        }
+        if (!picked) {
+#pragma unroll
+            for (int i = 0; i < 16; ++i)
+                if (s[i] > best) { best = s[i]; be = lane + 32 * i; bp = p[i]; }
+#pragma unroll
+            for (int m = 16; m; m >>= 1) {
+                const float ob = __shfl_xor_sync(0xffffffffu, best, m, 32);
+                const int oe = __shfl_xor_sync(0xffffffffu, be, m, 32);
+                const float op = __shfl_xor_sync(0xffffffffu, bp, m, 32);
+                if (ob > best || (ob == best && oe < be)) { best = ob; be = oe; bp = op; }
+            }
         }
         if ((be & 31) == lane) s[be >> 5] = -FLT_MAX;
         if (lane == rank) { id[rank] = be; sel_p = bp; }
@@ -70,10 +99,23 @@ __global__ void route_prior_k(const float* __restrict__ logits, const int32_t* _
 
 }  // namespace
 
+namespace {
+const float* g_prior_gate = nullptr;
+int g_prior_protect = 0;
+float g_prior_keep_p = 0.0f;
+}  // namespace
+
+void route_prior_configure(const float* gate, int protect, float keep_p) {
+    g_prior_gate = gate;
+    g_prior_keep_p = keep_p > 0.0f ? keep_p : 0.0f;
+    g_prior_protect = protect < 0 ? 0 : protect > 10 ? 10 : protect;
+}
+
 void route_prior_top10(const float* logits, const int32_t* res_layer, float lambda, int32_t* ids, float* weights,
                              int n_tok, void* stream) {
     if (n_tok <= 0) return;
-    route_prior_k<<<n_tok, 32, 0, (cudaStream_t) stream>>>(logits, res_layer, lambda, ids, weights);
+    route_prior_k<<<n_tok, 32, 0, (cudaStream_t) stream>>>(logits, res_layer, lambda, ids, weights, g_prior_gate,
+                                                           g_prior_protect, g_prior_keep_p);
 }
 
 }  // namespace strata::kernels
