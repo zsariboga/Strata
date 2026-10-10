@@ -187,8 +187,7 @@ void prior_gate_init() {
         float* h = nullptr;
         if (cudaHostAlloc((void**) &h, sizeof(float), cudaHostAllocMapped) != cudaSuccess ||
             cudaHostGetDevicePointer((void**) &d_gate, h, 0) != cudaSuccess) {
-            std::fprintf(stderr, "strata serve: STRATA_ROUTE_PRIOR_SCOPE could not be set up; PRIOR everywhere
-");
+            std::fprintf(stderr, "strata serve: STRATA_ROUTE_PRIOR_SCOPE could not be set up; PRIOR everywhere\n");
             d_gate = nullptr;
         } else {
             *(volatile float*) h = 0.0f;
@@ -198,8 +197,7 @@ void prior_gate_init() {
         }
     }
     strata::kernels::route_prior_configure(d_gate, protect, keep_p);
-    std::fprintf(stderr, "strata serve: STRATA_ROUTE_PRIOR %.2f, scope %s, router's first %d picks protected, keep_p %.2f
-", lambda,
+    std::fprintf(stderr, "strata serve: STRATA_ROUTE_PRIOR %.2f, scope %s, router's first %d picks protected, keep_p %.2f\n", lambda,
                  scope == 2 ? "all (gated)" : scope == 1 ? "answer" : scope == 0 ? "think" : "everywhere (no gate)", protect, keep_p);
 }
 // Windows' WDDM driver model: native Windows, or WSL2 (its GPU goes through /dev/dxg to the Windows driver).  There,
