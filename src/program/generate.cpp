@@ -7246,6 +7246,7 @@ int main(int argc, char** argv) {
             int32_t first = -1;            // the first slot it may lend, for the chunk that was chosen
             int32_t first_now = -1;        // where its buffers are laid out now
             int64_t lent_chunk = 0;
+            int64_t stage_tok_now = -1;    // local STRATA_PREFILL_STAGE_FIT: the K/V pool's tokens it was laid out for
             std::vector<std::pair<int32_t, int32_t>> lent;
         };
         // bytes -> slots for one cache: exact when it knows its per-slot offsets (a native pack's blobs differ
@@ -11313,7 +11314,8 @@ int main(int argc, char** argv) {
                 for (PfPart& p : pf_parts) {
                     if (p.first < 0) continue;
                     if (!p.lent.empty()) {
-                        if (want <= p.lent_chunk) continue;            // its current loan already covers this
+                        if (want <= p.lent_chunk && strata::prefill::Prefill::stage_tokens() == p.stage_tok_now)
+                            continue;                                  // its current loan already covers this
                         // ONLY this participant's loan goes back: `refill` would return the other participants'
                         // loans too, and their buffers are still laid out in their caches - marking those slots
                         // resident again would hand the next window a prompt buffer in place of an expert
@@ -11321,9 +11323,11 @@ int main(int argc, char** argv) {
                     }
                     const strata::core::OnDevice on(p.dev);
                     const int32_t first = std::max<int32_t>(p.first, (int32_t) (p.cache->slots() - part_slots(p, want)));
-                    if (want != p.sp->chunk() || first != p.first_now) {
+                    const int64_t stage_tok = strata::prefill::Prefill::stage_tokens();
+                    if (want != p.sp->chunk() || first != p.first_now || stage_tok != p.stage_tok_now) {
                         if (!p.sp->relayout(want, p.cache->device_slot(first), part_bytes(p, first), e)) return false;
                         p.first_now = first;
+                        p.stage_tok_now = stage_tok;
                     }
                     for (int64_t l = p.lb; l < p.le; ++l)              // THIS participant's layers only
                         for (int64_t ex = 0; ex < g.n_expert; ++ex) {
@@ -11559,6 +11563,13 @@ int main(int argc, char** argv) {
             if (pin_at >= 0) {
                 cuts.push_back(pin_at);
                 std::sort(cuts.begin(), cuts.end());   // the skipped -1s first, n - 1 still last
+            }
+            // local STRATA_PREFILL_STAGE_FIT=1: the prompt path's K/V staging pool covers this request's positions
+            // (rounded up to 8K, so a growing conversation relays it out once every 8K tokens), not the whole context:
+            // fewer slots lent for a short read.  The pool is indexed by position; nothing past `n` is read or written.
+            {
+                static const bool stage_fit = [] { const char* v = std::getenv("STRATA_PREFILL_STAGE_FIT"); return v && v[0] == '1'; }();
+                if (stage_fit) strata::prefill::Prefill::set_stage_tokens(((n + 8191) / 8192) * 8192);
             }
             int64_t at = read_from;
             for (const int64_t to : cuts) {

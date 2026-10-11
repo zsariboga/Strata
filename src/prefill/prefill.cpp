@@ -223,6 +223,7 @@ double g_pinned_share = 1.0;
 // slot count is derived from the pack (`ring_budget_slots`); Q2_0 still resolves to exactly 1024 (fused) and 384,
 // so the pack all of this was tuned on does not move.
 int g_ring_override = 0;   // #340: set by a layer split (Prefill::set_ring_override); 0 = the rule below
+int64_t g_stage_tokens = 0;   // local STRATA_PREFILL_STAGE_FIT (Prefill::set_stage_tokens); 0 = the whole context
 // #583 (0.1.39b): the auto chunk scan's byte-budget ring (Prefill::set_ring_budget), for requests whose chunk is above
 // g_ring_small_max - the chunk 0.1.39's rule would have picked.  A prompt that fits that chunk keeps 0.1.39's ring:
 // on one chunk the smaller ring only slowed it (RTX 5070, 4K prompts: Coder -15%, IQ3_S -5%, IQ3_XXS -2%).
@@ -925,7 +926,11 @@ void take_stage(Alloc& o_borrowed, const core::SessionState& ss, const strata::k
     Alloc own;
     own.owned = o_borrowed.owned;
     Alloc& o = stage_own() ? own : o_borrowed;
-    const size_t rows = (size_t) q0.n_pages * s.n_head_kv * s.page_size;
+    // local STRATA_PREFILL_STAGE_FIT: the pool is indexed by position (row_id), so a request ending at position P
+    // reads and writes only its first ceil(P / page_size) pages
+    size_t pages = (size_t) q0.n_pages;
+    if (g_stage_tokens > 0) pages = std::min(pages, (size_t) ((g_stage_tokens + s.page_size - 1) / s.page_size));
+    const size_t rows = pages * s.n_head_kv * s.page_size;
     if (q0.kv_hybrid) {   // K8V4: the three runs of kKvHybrid; pools_of() then reads as the hybrid pools (mode 3)
         st.k_q = o.take<int8_t>(rows * s.head_dim, ok);
         st.k_scale = o.take<uint16_t>(rows * (s.head_dim / 64), ok);
@@ -1860,6 +1865,8 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& e
 
 void Prefill::set_pinned_share(double share) { g_pinned_share = share; }
 void Prefill::set_ring_override(int slots) { g_ring_override = slots > 0 ? slots : 0; }
+void Prefill::set_stage_tokens(int64_t tokens) { g_stage_tokens = tokens > 0 ? tokens : 0; }
+int64_t Prefill::stage_tokens() { return g_stage_tokens; }
 void Prefill::set_ring_budget(int slots, int64_t small_max) {
     g_ring_budget = slots > 0 ? slots : 0;
     g_ring_small_max = small_max > 0 ? small_max : 0;
