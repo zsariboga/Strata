@@ -1405,11 +1405,11 @@ if (strata::core::hc_host_requested()) {
         for (int j = 0; j < 2; ++j) {
             const int b = 2 * h + j;
             if (stage_bytes[b] < wr[j]->bytes) {
-                if (stage[b] != nullptr) { cudaStreamSynchronize(stream); cudaFree(stage[b]); stage[b] = nullptr; }
+                if (stage[b] != nullptr) { cudaStreamSynchronize((cudaStream_t) stream); cudaFree(stage[b]); stage[b] = nullptr; }
                 if (cudaMalloc(&stage[b], wr[j]->bytes) != cudaSuccess) { err = "STRATA_HC_HOST: staging cudaMalloc"; return false; }
                 stage_bytes[b] = wr[j]->bytes;
             }
-            if (cudaMemcpyAsync(stage[b], wr[j]->data, wr[j]->bytes, cudaMemcpyDefault, stream) != cudaSuccess) {
+            if (cudaMemcpyAsync(stage[b], wr[j]->data, wr[j]->bytes, cudaMemcpyDefault, (cudaStream_t) stream) != cudaSuccess) {
                 err = "STRATA_HC_HOST: staging copy"; return false;
             }
         }
