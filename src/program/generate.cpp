@@ -12570,9 +12570,11 @@ int main(int argc, char** argv) {
             if (static const bool pstat = std::getenv("STRATA_PREFILL_STATS") != nullptr; pstat) {
                 static strata::prefill::PrefillStats prev{};
                 const strata::prefill::PrefillStats& ps = sp.stats();
-                std::fprintf(stderr, "strata serve: prompt experts: streamed %lld (DMA %lld), resident %lld, on the CPU %lld (share %.2f), "
-                                     "batched tokens %lld, host staging %.1f ms\n",
+                std::fprintf(stderr, "strata serve: prompt experts: streamed %lld (DMA %lld, %.2f GB, %.1f GB/s over the read), resident %lld, "
+                                     "on the CPU %lld (share %.2f), batched tokens %lld, host staging %.1f ms\n",
                              (long long) (ps.experts_streamed - prev.experts_streamed), (long long) (ps.experts_dma - prev.experts_dma),
+                             (double) (ps.bytes_streamed - prev.bytes_streamed) / 1e9,
+                             prompt_ms > 0 ? (double) (ps.bytes_streamed - prev.bytes_streamed) / 1e6 / prompt_ms : 0.0,
                              (long long) (ps.experts_resident - prev.experts_resident), (long long) (ps.experts_cpu - prev.experts_cpu),
                              ps.cpu_share, (long long) (ps.tokens - prev.tokens), ps.ms_experts_host - prev.ms_experts_host);
                 prev = ps;

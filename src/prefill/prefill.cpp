@@ -313,6 +313,12 @@ inline int ring_slots(size_t T) {
 }
 // The staging buffers a layout holds: the ring, and at least STAGE_GRP for the staged walk's grouped gather.  Counted
 // and taken through this one place, so the bytes the prompt path borrows cover every buffer it writes.
+// local STRATA_PREFILL_COPY_KICK=1: after each expert copy, cudaStreamQuery on the copy stream - under WDDM a queued
+// command can wait in the driver's user-mode buffer until it fills; the query submits it (no wait, no sync)
+inline bool copy_kick() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_PREFILL_COPY_KICK"); return v != nullptr && v[0] == '1'; }();
+    return on;
+}
 inline int stage_grp_slots() {   // local STRATA_PREFILL_STAGE_GRP (see the staged walk); within RING_MAX
     static const int n = [] { const char* v = std::getenv("STRATA_PREFILL_STAGE_GRP"); return v ? std::atoi(v) : STAGE_GRP; }();
     return std::max(STAGE_GRP, std::min(n, RING_MAX));
@@ -3765,12 +3771,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 // DMA straight from the page-locked arena: the copy stream only waits for the slot
                                 if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[m.used_of[sl]], 0);
                                 cudaMemcpyAsync(m.stage_dev[sl], b, (size_t) lay.blob_bytes(l), cudaMemcpyHostToDevice, m.copy);
+                                if (copy_kick()) cudaStreamQuery(m.copy);   // local STRATA_PREFILL_COPY_KICK: push WDDM's queued copy to the GPU now
                                 ++stats_.experts_dma;
                             } else {
                                 // copied to a pinned buffer by the stager (waits only if it is behind), then DMA
                                 const uint8_t* hb = m.stager->wait(job_of[j]);
                                 if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[m.used_of[sl]], 0);
                                 cudaMemcpyAsync(m.stage_dev[sl], hb, (size_t) lay.blob_bytes(l), cudaMemcpyHostToDevice, m.copy);
+                                if (copy_kick()) cudaStreamQuery(m.copy);   // local STRATA_PREFILL_COPY_KICK: push WDDM's queued copy to the GPU now
                                 m.stager->issued_one(job_of[j], m.copy);
                             }
                             cudaEventRecord(m.copied[sl], m.copy);
@@ -3778,6 +3786,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             stage_of[j] = sl;
                             stats_.ms_experts_host += ms_since(th);
                             ++stats_.experts_streamed;
+                            stats_.bytes_streamed += (int64_t) lay.blob_bytes(l);
                             return true;
                         };
                         // In the streamed walk an MMQ group is gathered in ONE launch, after ONE wait on its last
