@@ -313,7 +313,11 @@ inline int ring_slots(size_t T) {
 }
 // The staging buffers a layout holds: the ring, and at least STAGE_GRP for the staged walk's grouped gather.  Counted
 // and taken through this one place, so the bytes the prompt path borrows cover every buffer it writes.
-inline int stage_slots(size_t T) { return std::max(ring_slots(T), STAGE_GRP); }
+inline int stage_grp_slots() {   // local STRATA_PREFILL_STAGE_GRP (see the staged walk); within RING_MAX
+    static const int n = [] { const char* v = std::getenv("STRATA_PREFILL_STAGE_GRP"); return v ? std::atoi(v) : STAGE_GRP; }();
+    return std::max(STAGE_GRP, std::min(n, RING_MAX));
+}
+inline int stage_slots(size_t T) { return std::max(ring_slots(T), stage_grp_slots()); }
 constexpr int DQ = 2;              // dequantized-expert ring (FP16 gate/up + down)
 // The BF16-weight projections (hyper-connection, SSM alpha/beta, indexer, router, shared gate, PLE key/value) take
 // BF16 activations here and FP32 ones in decode. STRATA_PREFILL_BF16X2=1 adds each activation's BF16 remainder as a
@@ -812,6 +816,7 @@ struct Prefill::Impl {
     uint16_t* dq_gu[DQ] = {};
     uint16_t* dq_d[DQ] = {};
     uint8_t* stage_dev[RING_MAX] = {};
+    int n_stage = 0;                       // local: the slots carved (stage_slots of the layout's chunk)
     int ring = STAGE;                        // the slots of this layout's ring (ring_slots)
     // this layout's GU, H and Xq are the fused path's (moe_bufs' `fused`), so a layer that runs MMQ or the FP16 path may
     // only write stream_all_min() - 1 of its rows into them; fused_layout() keeps the two in step (#583, #954)
@@ -1264,6 +1269,7 @@ bool Prefill::carve(size_t T, void* alloc) {
     }
     m.ring = ring_slots(T);
     const int nstage = stage_slots(T);   // the staged walk may use STAGE_GRP of them
+    m.n_stage = nstage;
     if (o.base == nullptr && m.ring > 0) {
         // OWNED buffers: the ring in ONE allocation.  384 separate 2.7 MiB cudaMallocs each round up to a 2 MiB page
         // (~1.3 MiB a slot, ~0.5 GiB in all) that no count ever saw.  A borrowed region keeps its per-slot layout (and
@@ -3716,7 +3722,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         const bool group_resident = group_env && !stream_all && use_mmq && lay.native &&
                                                     MMQ_GROUP <= mmq::kGatherGroupMax;
                         const bool gg_now = group_gather || group_resident;
-                        const int stage_n = group_resident ? STAGE_GRP : STAGE;
+                        // local STRATA_PREFILL_STAGE_GRP=N: the staged walk's ring of N slots (of the n_stage the layout carved
+                        // for its long chunks, so no more VRAM), staging N - MMQ_GROUP - 1 entries ahead instead of 15: the
+                        // copy stream keeps the bus busy while a group computes.  Default 32 (as before).
+                        static const int stage_grp_env = [] { const char* v = std::getenv("STRATA_PREFILL_STAGE_GRP"); return v ? std::atoi(v) : STAGE_GRP; }();
+                        const int stage_grp = std::max(STAGE_GRP, std::min(stage_grp_env, std::max(m.n_stage, STAGE_GRP)));
+                        const int stage_n = group_resident ? stage_grp : STAGE;
                         // Stage ahead: the copy stream moves blobs host -> device while the compute stream works.
                         int stage_next = 0;
                         std::vector<int> stage_of(order.size(), -1);
@@ -3931,7 +3942,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             // grouped: a group's slots are released only at its flush, so the count-based stream-ahead could
                             // restage a slot of the open group - the grouped walk keeps its fixed lookahead
                             const bool stream_ahead = stream_ahead_enabled() && !group_resident;
-                            const size_t lookahead = group_resident ? (size_t) (STAGE_GRP - MMQ_GROUP - 1) : STAGE - 1;
+                            const size_t lookahead = group_resident ? (size_t) (stage_grp - MMQ_GROUP - 1) : STAGE - 1;
                             for (size_t j = 0; j < order.size(); ++j) {
                                 // Resident experts occupy no staging slot. Keep STAGE actual transfers ahead,
                                 // rather than STAGE positions in the mixed resident/streamed order.
