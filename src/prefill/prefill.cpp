@@ -2533,6 +2533,29 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 const core::WeightRef *wn = need(v, sn.c_str(), err), *wd = need(v, sd.c_str(), err),
                                       *wu = need(v, su.c_str(), err), *wi = need(v, si.c_str(), err);
                 if (!wn || !wd || !wu || !wi) return false;
+                // local STRATA_HC_HOST=1: the down/up pair lives in pinned host memory; one device copy per layer and
+                // half, in stream order before the reads below (two staging buffers, ~13 MB)
+                core::WeightRef wd_staged, wu_staged;
+                if (core::hc_host_requested()) {
+                    static void* stage[2] = {nullptr, nullptr};
+                    static uint64_t stage_bytes[2] = {0, 0};
+                    const core::WeightRef* src[2] = {wd, wu};
+                    core::WeightRef* dst[2] = {&wd_staged, &wu_staged};
+                    for (int j = 0; j < 2; ++j) {
+                        if (stage_bytes[j] < src[j]->bytes) {
+                            if (stage[j] != nullptr) { cudaStreamSynchronize(m.cs); cudaFree(stage[j]); stage[j] = nullptr; }
+                            if (cudaMalloc(&stage[j], src[j]->bytes) != cudaSuccess) { err = "STRATA_HC_HOST: prefill staging"; return false; }
+                            stage_bytes[j] = src[j]->bytes;
+                        }
+                        if (cudaMemcpyAsync(stage[j], src[j]->data, src[j]->bytes, cudaMemcpyDefault, m.cs) != cudaSuccess) {
+                            err = "STRATA_HC_HOST: prefill staging copy"; return false;
+                        }
+                        *dst[j] = *src[j];
+                        dst[j]->data = stage[j];
+                    }
+                    wd = &wd_staged;
+                    wu = &wu_staged;
+                }
                 pt.mark(kPfHc, cs);
                 // the xn16 token stride of this chunk (the writers of both halves and of the fused write-backs use it)
                 const int64_t ldx = hc_pad() && T >= std::max<int64_t>(pf_switch_min_t(), 64) && !gr_unfused() &&
