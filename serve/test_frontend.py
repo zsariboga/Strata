@@ -201,3 +201,20 @@ class ForcedCallOpening(unittest.TestCase):
         self.assertTrue(forced_call("required", one).endswith("<function=a>\n"))
         self.assertTrue(forced_call("required", two).endswith("<function="))
         self.assertIsNone(forced_call("auto", one))
+
+
+class BooleanToolArguments(unittest.TestCase):
+    """A boolean parameter written the Python way (True/False) is a boolean, not the string "True"."""
+
+    def test_python_and_json_booleans(self):
+        from serve.frontend import parse_tool_call
+        schema = {"parameters": {"properties": {"on": {"type": "boolean"}, "room": {"type": "string"},
+                                                "level": {"type": "integer"}}}}
+        for written, want in (("True", True), ("False", False), ("true", True), ("false", False), (" TRUE ", True)):
+            with self.subTest(written=written):
+                call = parse_tool_call(f"<function=light>\n<parameter=on>\n{written}\n</parameter>\n"
+                                       "<parameter=room>\nTrue\n</parameter>\n<parameter=level>\n40\n</parameter>\n"
+                                       "</function>", schema)
+                self.assertEqual(call.arguments, {"on": want, "room": "True", "level": 40})
+        self.assertEqual(parse_tool_call("<function=light>\n<parameter=on>\nmaybe\n</parameter>\n</function>",
+                                         schema).arguments, {"on": "maybe"})
