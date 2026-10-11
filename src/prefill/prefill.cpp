@@ -3309,9 +3309,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             int64_t nstream = 0;
                             for (int32_t e = 0; e < m.g->n_expert; ++e) {
                                 const int32_t c = m.cnt[(size_t) e];
-                                if (c == 0 || (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) || pf_of(e))
+                                if (c == 0 || (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0))
                                     continue;
                                 ++nstream;
+                                if (pf_of(e)) continue;   // prefetched: in the share's base (the CPU's take stays), never the CPU's
                                 // a blob the CPU reads from RAM: page-locked, or any other that is not assembled into a
                                 // short-lived buffer (the arena's unpinned part, the mapped experts.bin's pages)
                                 if (c <= strata::kernels::cpu::MAXT && (m.src->pinned(l, e) || !m.src->transient(l, e)))
