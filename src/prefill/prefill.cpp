@@ -3779,6 +3779,16 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         mmq::GatherGroup gg;
                         int gg_slots[MMQ_GROUP];
                         int gg_nslots = 0;   // ring slots gathered by the next flush
+                        // local STRATA_PREFILL_MMQ_PTR=1 (short staged walk only): gate/up are not gathered - the MMQ reads
+                        // each expert's gate/up rows where they lie (a cache slot or a ring slot) through a table of
+                        // addresses; only the down matrix is gathered (its last row's tile reads past the matrix).  The
+                        // ring slots are released after the gate/up product instead of after the gather.
+                        static const bool mmq_ptr_env = [] { const char* v = std::getenv("STRATA_PREFILL_MMQ_PTR"); return v != nullptr && v[0] == '1'; }();
+                        const bool mmq_ptr = mmq_ptr_env && group_resident && use_mmq && lay.native &&
+                                             lay.fmt[(size_t) l].up_off == mmq_gub / 2;
+                        const void* gu_ptrs[MMQ_GROUP] = {};
+                        int ptr_rel[MMQ_GROUP];
+                        int ptr_nrel = 0;
                         auto flush = [&]() {
                             if (gg.n <= gg.first) return;
                             const auto& f = lay.fmt[(size_t) l];
@@ -3787,15 +3797,18 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 cudaStreamWaitEvent(m.cs, m.copied[gg_slots[gg_nslots - 1]], 0);
                                 pt.mark(kPfDequant, cs);
                             }
-                            if (!mmq::gather_native_group(gg, f.up_off, mmq_gub / 2, f.down_off, mmq_db, m.grp_gu, mmq_gub,
+                            const size_t gu_half = mmq_ptr ? 0 : mmq_gub / 2;   // pointer mode: the down matrix only
+                            if (!mmq::gather_native_group(gg, f.up_off, gu_half, f.down_off, mmq_db, m.grp_gu, mmq_gub,
                                                           m.grp_d, mmq_db, m.cs)) {
                                 for (int i = gg.first; i < gg.n; ++i) {   // not 16-byte aligned: one at a time
                                     const uint8_t* b = gg.blob[i];
-                                    mmq::gather_native(b, b + f.up_off, mmq_gub / 2, b + f.down_off, mmq_db,
+                                    mmq::gather_native(b, b + f.up_off, gu_half, b + f.down_off, mmq_db,
                                                        m.grp_gu + i * mmq_gub, m.grp_d + i * mmq_db, m.cs);
                                 }
                             }
-                            if (gg_nslots > 0) {
+                            if (mmq_ptr) {   // released after the gate/up product reads them
+                                for (int i = 0; i < gg_nslots; ++i) ptr_rel[ptr_nrel++] = gg_slots[i];
+                            } else if (gg_nslots > 0) {
                                 const int rel = gg_slots[gg_nslots - 1];
                                 cudaEventRecord(m.used[rel], m.cs);
                                 for (int i = 0; i < gg_nslots; ++i) m.used_of[gg_slots[i]] = rel;
@@ -3813,6 +3826,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 const size_t q = j % MMQ_GROUP;
                                 if (gg_now) {
                                     gg.blob[q] = blob_dev;
+                                    gu_ptrs[q] = blob_dev;
                                     gg.n = (int) q + 1;
                                     if (slot >= 0) gg_slots[gg_nslots++] = slot;
                                     if (q + 1 < MMQ_GROUP && j + 1 < order.size()) return true;
@@ -3841,7 +3855,33 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 gu.w = m.grp_gu; gu.type = mmq_gt; gu.w_rows = 1280; gu.w_cols = N; gu.expert_bytes = mmq_gub;
                                 gu.n = ngx; gu.xq = m.Xq; gu.bounds = m.bounds_dev + j0; gu.ids = m.ids_identity;
                                 gu.total_rows = T * K; gu.max_rows = maxr; gu.dst = m.GU; gu.ld_dst = 1280;
+                                if (mmq_ptr) {
+                                    // the group's addresses in a mapped pinned ring (a layer's host sync retires it)
+                                    static const void** tbl_h = nullptr;
+                                    static const void** tbl_d = nullptr;
+                                    static size_t tbl_i = 0;
+                                    constexpr size_t TBL_N = 4096;
+                                    if (tbl_h == nullptr) {
+                                        void* hp = nullptr;
+                                        void* dp = nullptr;
+                                        if (cudaHostAlloc(&hp, TBL_N * MMQ_GROUP * sizeof(void*), cudaHostAllocMapped) != cudaSuccess ||
+                                            cudaHostGetDevicePointer(&dp, hp, 0) != cudaSuccess) {
+                                            err = "STRATA_PREFILL_MMQ_PTR: table"; return false;
+                                        }
+                                        tbl_h = (const void**) hp;
+                                        tbl_d = (const void**) dp;
+                                    }
+                                    const size_t at = (tbl_i++ % TBL_N) * MMQ_GROUP;
+                                    for (int i = 0; i < ngx; ++i) tbl_h[at + i] = gu_ptrs[i];
+                                    gu.w_table = tbl_d + at;
+                                }
                                 m.mmq_ctx->run(gu, m.cs);
+                                if (mmq_ptr && ptr_nrel > 0) {
+                                    const int rel = ptr_rel[ptr_nrel - 1];
+                                    cudaEventRecord(m.used[rel], m.cs);
+                                    for (int i = 0; i < ptr_nrel; ++i) m.used_of[ptr_rel[i]] = rel;
+                                    ptr_nrel = 0;
+                                }
                                 // swiglu and H's q8_1 rows in one pass where the down type reads D4 rows
                                 const bool sq = swiglu_quant_on() && mmq::swiglu_quant_ok(mmq_dt);
                                 if (sq) mmq::swiglu_quant(m.GU + r0 * 1280, m.Hq, nr, !lay.native, m.cs);

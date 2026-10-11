@@ -252,9 +252,10 @@ void Context::run(const Product& p, void* stream) {
     if (p.n <= 0 || p.max_rows <= 0) return;
     const ggml_type t = (ggml_type) p.type;
     const int64_t qk = ggml_blck_size(t), bpr = p.w_cols / qk;
-    const mmq_args a = {(const char*) p.w, t, (const int*) p.xq, p.ids, p.bounds, p.dst, nullptr,
+    const mmq_args a = {p.w_table ? (const char*) p.w_table : (const char*) p.w, t, (const int*) p.xq, p.ids, p.bounds,
+                        p.dst, nullptr,
                         p.w_cols, p.w_rows, p.total_rows, bpr, p.total_rows, p.ld_dst,
-                        p.n, p.n, (int64_t) (p.expert_bytes / ggml_type_size(t)), 0, 0,
+                        p.n, p.n, p.w_table ? (int64_t) -1 : (int64_t) (p.expert_bytes / ggml_type_size(t)), 0, 0,
                         1, 1, 0, 0, 0,
                         p.max_rows, p.max_rows};
     auto& ctx = *(ggml_backend_cuda_context*) ctx_;

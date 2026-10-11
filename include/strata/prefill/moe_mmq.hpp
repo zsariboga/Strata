@@ -42,6 +42,10 @@ void quantize_scatter(const float* x, const int32_t* slot, const int32_t* src, v
 /// `total_rows`: the rows of xq; `max_rows`: the most rows one expert has (the launch grid).
 struct Product {
     const void* w = nullptr;
+    /// local STRATA_PREFILL_MMQ_PTR: when set, a device-readable table of `n` matrix addresses (one per expert) read in
+    /// place of `w` + e * expert_bytes, so the experts need not be gathered into one buffer (the llama.cpp copy in
+    /// D:\bonsai2\llama-ptr takes a negative stride_channel_x as "x is such a table")
+    const void* const* w_table = nullptr;
     int type = -1;
     int64_t w_rows = 0, w_cols = 0;
     size_t expert_bytes = 0;
