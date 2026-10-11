@@ -1,7 +1,7 @@
-# Tuning Strata on a 12 GB laptop: 55 → 118 tok/s
+# Tuning Strata on a 12 GB laptop: 55 → 140 tok/s
 
-This branch (`laptop-12gb`) is the exact engine and server I run every day on a gaming laptop. It is Strata
-v0.1.41 plus some community PRs that are not merged upstream, plus a few local changes. Everything here was measured
+This fork's `main` branch is the exact engine and server I run every day on a gaming laptop. It is Strata
+v0.1.43 plus some community PRs that are not merged upstream, plus a few local changes. Everything here was measured
 on one machine over five days (4–8 October 2026). The 7–8 October work is in "Since 0.1.40.1" and "Since 0.1.40.3" below. Most of the local changes are opt-in switches, and with them off
 the engine behaves like the code it sits on.
 
@@ -407,6 +407,35 @@ rounds, where its neighbours suggest about 46 ms. The copies got slower from sta
 
 With #1316 the late-session drop is gone. The copied file grew a little with #1316 itself, so the two runs are not
 the same text. The gain is about 2-3% at most and only on copy-heavy work. It is lossless, so it is on.
+
+## Since 0.1.41 (9–11 October): now v0.1.43
+
+v0.1.42 and v0.1.43 are merged in with every local change kept. Measured on the agent workload (32 real opencode turns
+from held-out sessions, 256 tokens each, temperature 1.0, engine `ms/token`, mirrored run orders) unless a row says
+otherwise. 0.1.42 → 0.1.43 measured the same here (8.553 vs 8.578 ms/token), as its release notes say for an RTX 5070
+on Windows.
+
+| change | type | measure |
+|---|---|---|
+| `STRATA_HC_HOST=1` + `STRATA_HC_Q8=1`: the hyper-connection down/up BF16 pairs in pinned RAM, the verify windows read a Q8_0 copy, the prompt path stages a layer's pair on its own stream | local | −8.4% ms/token, +253 expert-cache slots; then −1.3% with the two-slot prefetch |
+| #1888 `STRATA_QSA_SPLIT_ATTN=1` (split decode attention) | PR, not bitwise | −4.7% ms/token, KL 0.038 |
+| `--adapt-decay 0.9` (was 0.97), chosen with an offline cache simulator | setting | −3.3% ms/token |
+| MTP head re-fit on my own opencode history (`refit-a`), Q2_0 experts from #1934, draft vocabulary built from the corpus (47K tokens, `--mtp-draft-vocab`), `--mtp-window 4096` | local + PR | draft vocabulary −4 to −6% ms/token; re-fit +16–21% offline acceptance |
+| `STRATA_PREFILL_STREAM_MIN=3072` (was 2048) | setting | 2.1–2.9K-token prompt reads −15 to −17% (with HC_HOST in place) |
+| `STRATA_ROUTE_PRIOR=0.5` (+ local `_KEEP_P` / `_PROTECT` / `_SCOPE` switches) | PR + local, lossy | used together with CAR |
+| serve: #1854 loop guard, #1881 (an unclosed tool call ends at its `</function>`), #1953 (keep-alive as a real SSE frame - opencode's idle timeout), #1955 (`True`/`False` tool arguments as booleans) | PRs | correctness |
+| #1959 `--prompt-cache-spread`, #1949 (AVX2 router dot) | PRs | lossless; no speed change on the agent set |
+
+30-question set, 10 October: **140.4 tok/s** engine decode (110.8 client), 30/30; Turkish 116 tok/s.
+
+Measured and **rejected** in this period (the code stays as opt-in switches, off by default): next-layer expert
+prefetch for short prompts (`STRATA_PREFILL_PF_NEXT`), K/V staging sized to the request (`STRATA_PREFILL_STAGE_FIT`),
+a larger staged ring (`STRATA_PREFILL_STAGE_GRP`), pushing WDDM's copy queue (`STRATA_PREFILL_COPY_KICK`), MMQ
+reading gate/up in place (`STRATA_PREFILL_MMQ_PTR`), the Latin draft vocabulary (#1963; −2% on the agent set), a
+DALI-style cache policy (+4% misses in the simulator). `STRATA_PREFILL_STATS=1` prints each prompt's expert counts and
+PCIe bytes. Why short prompt reads leave PCIe half idle on this laptop: in a layer's non-expert phase nothing can be
+copied yet (the router has not run); in the expert phase the bus runs at ~25 of ~27.5 GB/s. The expert weights do not
+compress (IQ formats: lzma ratio 1.00).
 
 ## What did not help here (measured and rejected)
 
