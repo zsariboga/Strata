@@ -3786,6 +3786,16 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         static const bool mmq_ptr_env = [] { const char* v = std::getenv("STRATA_PREFILL_MMQ_PTR"); return v != nullptr && v[0] == '1'; }();
                         const bool mmq_ptr = mmq_ptr_env && group_resident && use_mmq && lay.native &&
                                              lay.fmt[(size_t) l].up_off == mmq_gub / 2;
+                        if (mmq_ptr_env) {
+                            static int said = 0;
+                            if (said < 3) {
+                                ++said;
+                                std::fprintf(stderr, "strata prefill: MMQ_PTR layer %lld T %lld: ptr %d (group_resident %d use_mmq %d "
+                                                     "native %d up_off %zu gub/2 %zu stream_all %d)\n", (long long) l, (long long) T,
+                                             (int) mmq_ptr, (int) group_resident, (int) use_mmq, (int) lay.native,
+                                             lay.fmt.empty() ? (size_t) 0 : lay.fmt[(size_t) l].up_off, mmq_gub / 2, (int) stream_all);
+                            }
+                        }
                         const void* gu_ptrs[MMQ_GROUP] = {};
                         int ptr_rel[MMQ_GROUP];
                         int ptr_nrel = 0;

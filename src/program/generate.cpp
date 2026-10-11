@@ -12566,6 +12566,17 @@ int main(int argc, char** argv) {
                          prompt_ms > 0 ? 1000.0 * read_n / prompt_ms : 0.0, (long long) produced_n, decode_ms,
                          decode_ms > 0 ? 1000.0 * produced_n / decode_ms : 0.0, (long long) draft_accepted,
                          (long long) draft_offered, checks.size(), cancelled ? " (cancelled)" : "");
+            // local STRATA_PREFILL_STATS=1: this prompt's batched read, from the running totals (the one-shot path's line)
+            if (static const bool pstat = std::getenv("STRATA_PREFILL_STATS") != nullptr; pstat) {
+                static strata::prefill::PrefillStats prev{};
+                const strata::prefill::PrefillStats& ps = sp.stats();
+                std::fprintf(stderr, "strata serve: prompt experts: streamed %lld (DMA %lld), resident %lld, on the CPU %lld (share %.2f), "
+                                     "batched tokens %lld, host staging %.1f ms\n",
+                             (long long) (ps.experts_streamed - prev.experts_streamed), (long long) (ps.experts_dma - prev.experts_dma),
+                             (long long) (ps.experts_resident - prev.experts_resident), (long long) (ps.experts_cpu - prev.experts_cpu),
+                             ps.cpu_share, (long long) (ps.tokens - prev.tokens), ps.ms_experts_host - prev.ms_experts_host);
+                prev = ps;
+            }
             // the VRAM share of the experts the pool looked up while decoding; experts it sent over PCIe for the GPU
             // to read (--pcie-frac) are in neither count - #588: so that share is said beside it (raising --pcie-frac
             // raises the hit rate while the PCIe reads may make the decode slower)
