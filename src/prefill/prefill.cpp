@@ -319,9 +319,18 @@ inline bool copy_kick() {
     static const bool on = [] { const char* v = std::getenv("STRATA_PREFILL_COPY_KICK"); return v != nullptr && v[0] == '1'; }();
     return on;
 }
+// local STRATA_PREFILL_PF_NEXT=P (staged walk only): at each layer the NEXT layer's router is run on this layer's router
+// input, and the P non-resident experts it gives the most tokens are copied once this layer's own copies are issued -
+// while this layer's last groups, the next attention and router run, when the copy stream is otherwise idle.  The
+// next layer takes them as resident ones (no copy, no CPU share).  Two sets of P slots after the staged ring.  The
+// computed experts and their routing are unchanged: bit-identical.
+inline int pf_next_slots() {
+    static const int n = [] { const char* v = std::getenv("STRATA_PREFILL_PF_NEXT"); return v ? std::max(0, std::min(std::atoi(v), 256)) : 0; }();
+    return n;
+}
 inline int stage_grp_slots() {   // local STRATA_PREFILL_STAGE_GRP (see the staged walk); within RING_MAX
     static const int n = [] { const char* v = std::getenv("STRATA_PREFILL_STAGE_GRP"); return v ? std::atoi(v) : STAGE_GRP; }();
-    return std::max(STAGE_GRP, std::min(n, RING_MAX));
+    return std::max(STAGE_GRP, std::min(n, RING_MAX - 2 * pf_next_slots())) + 2 * pf_next_slots();
 }
 inline int stage_slots(size_t T) { return std::max(ring_slots(T), stage_grp_slots()); }
 constexpr int DQ = 2;              // dequantized-expert ring (FP16 gate/up + down)
@@ -2476,6 +2485,16 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 std::fprintf(stderr, "strata pf-step: chunk from token %lld, layer %lld: %s took %.0f ms (%s / %s)\n",
                              (long long) p0, (long long) layer, what, ms, cudaGetErrorString(a), cudaGetErrorString(b));
         };
+        // local STRATA_PREFILL_PF_NEXT: the next layer's prefetched blobs (by expert) and their slot set
+        int64_t pfn_layer = -1;
+        int pfn_buf = 0;
+        std::vector<const uint8_t*> pfn_dev;
+        static cudaEvent_t pf_done[2] = {}, pf_used[2] = {};
+        static bool pf_used_live[2] = {};
+        static int32_t* pf_ids_d = nullptr;
+        static float* pf_w_d = nullptr;
+        static int32_t* pf_ids_h = nullptr;
+        static int64_t pf_cap = 0;
         for (int64_t l = LB; l < LE; ++l) {
             core::progress_beat();   // the serve watchdog: a prompt chunk of 8192 tokens is still moving
             if (l > LB) pf_step("reading the prompt (batched, step sync): the experts and the rest of layer", l - 1);
@@ -2944,6 +2963,30 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     pt.mark(kPfRouter, cs);
                     if (!bf16_proj(m.gemm, wr, m.mixed_bf, m.logits, T, v.name("ffn_gate_inp.weight"), err, 0, m.mixed_bf_lo)) return false;
                     route(m.logits, m.ids, m.w, T, m.g->n_expert, m.cs);
+                    const int pf_p = pf_next_slots();
+                    const bool pf_pred = pf_p > 0 && !stream_all && !m.pp && l + 1 < LE && m.cache && m.host_res &&
+                                         m.n_stage - 2 * pf_p >= STAGE_GRP;
+                    if (pf_pred) {
+                        if (pf_cap < T * K) {
+                            if (pf_ids_d) { cudaFree(pf_ids_d); cudaFree(pf_w_d); cudaFreeHost(pf_ids_h); }
+                            pf_cap = T * K;
+                            if (cudaMalloc(&pf_ids_d, (size_t) pf_cap * 4) != cudaSuccess || cudaMalloc(&pf_w_d, (size_t) pf_cap * 4) != cudaSuccess ||
+                                cudaHostAlloc((void**) &pf_ids_h, (size_t) pf_cap * 4, cudaHostAllocDefault) != cudaSuccess) {
+                                err = "STRATA_PREFILL_PF_NEXT: buffers"; return false;
+                            }
+                            for (int b = 0; b < 2; ++b) {
+                                if (!pf_done[b]) cudaEventCreateWithFlags(&pf_done[b], cudaEventDisableTiming);
+                                if (!pf_used[b]) cudaEventCreateWithFlags(&pf_used[b], cudaEventDisableTiming);
+                            }
+                        }
+                        const core::LayerView vn(*m.wt, l + 1);
+                        const core::WeightRef* wrn = need(vn, "ffn_gate_inp.weight", err);
+                        if (!wrn) return false;
+                        // m.logits is free again (route() read it); the hi part of the input is enough for a guess
+                        if (!bf16_proj(m.gemm, wrn, m.mixed_bf, m.logits, T, vn.name("ffn_gate_inp.weight"), err)) return false;
+                        route(m.logits, pf_ids_d, pf_w_d, T, m.g->n_expert, m.cs);
+                        cudaMemcpyAsync(pf_ids_h, pf_ids_d, (size_t) T * K * 4, cudaMemcpyDeviceToHost, m.cs);
+                    }
                     // RESEARCH HOOK (141-research, opt-in, never on by default): STRATA_DBG_FEAT=<file> dumps, per MoE layer and chunk,
                     // the routed ids + weights (and for the layers in STRATA_DBG_FEAT_LAYERS the router-input hidden state, bf16);
                     // STRATA_DBG_ROUTE_OVERRIDE=<file> replaces the routing of the layers listed in that file with the file's ids + weights.
@@ -3249,12 +3292,24 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             if (e < 0 || e >= m.g->n_expert) { err = "prefill: routed id out of range"; return false; }
                             ++m.cnt[(size_t) e];
                         }
+                        // local STRATA_PREFILL_PF_NEXT: the blobs the previous layer prefetched for this one
+                        std::vector<const uint8_t*> pf_here;
+                        int pf_here_buf = 0;
+                        if (pfn_layer == l && !stream_all) {
+                            pf_here = std::move(pfn_dev);
+                            pf_here_buf = pfn_buf;
+                            for (int32_t e = 0; e < m.g->n_expert; ++e)
+                                if (pf_here[(size_t) e] != nullptr && m.cnt[(size_t) e] == 0) ++stats_.experts_pf_waste;
+                        }
+                        pfn_layer = -1;
+                        pfn_dev.clear();
+                        auto pf_of = [&](int32_t e) -> const uint8_t* { return pf_here.empty() ? nullptr : pf_here[(size_t) e]; };
                         if (cpu_maybe) {
                             std::vector<std::pair<int32_t, int32_t>> cand;   // (tokens, expert)
                             int64_t nstream = 0;
                             for (int32_t e = 0; e < m.g->n_expert; ++e) {
                                 const int32_t c = m.cnt[(size_t) e];
-                                if (c == 0 || (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0))
+                                if (c == 0 || (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) || pf_of(e))
                                     continue;
                                 ++nstream;
                                 // a blob the CPU reads from RAM: page-locked, or any other that is not assembled into a
@@ -3744,6 +3799,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             for (size_t j = 0; j < order.size(); ++j) {
                                 const int32_t e = order[j];
                                 if (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;
+                                if (pf_of(e)) continue;
                                 if (m.src->pinned(l, e)) continue;
                                 job_of[j] = (int) js.size();
                                 if (m.src->transient(l, e)) {   // CS-T: copied by the source
@@ -3760,7 +3816,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         auto stage_one = [&](size_t j) -> bool {
                             const int32_t e = order[j];
                             const bool resident = m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0;
-                            if (resident) return true;
+                            if (resident || pf_of(e)) return true;
                             const int sl = stage_next;
                             stage_next = (stage_next + 1) % stage_n;
                             const auto th = Clock::now();
@@ -3946,6 +4002,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             return true;
                         };
                         if (!stream_all) {
+                            if (!pf_here.empty()) cudaStreamWaitEvent(m.cs, pf_done[pf_here_buf], 0);   // the prefetch copies landed
                             size_t staged = 0;
                             size_t pending = 0;
                             // grouped: a group's slots are released only at its flush, so the count-based stream-ahead could
@@ -3961,7 +4018,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     ++staged;
                                 }
                                 const int32_t e = order[j];
-                                if (stage_of[j] < 0) {
+                                if (stage_of[j] < 0 && pf_of(e)) {
+                                    ++stats_.experts_pf;
+                                    if (!compute(j, pf_of(e), -1)) return false;
+                                } else if (stage_of[j] < 0) {
                                     ++stats_.experts_resident;
                                     if (!compute(j, m.cache->device_slot(m.host_res[(size_t) l * m.g->n_expert + e]), -1)) return false;
                                 } else {
@@ -3972,6 +4032,41 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     if (!compute(j, m.stage_dev[stage_of[j]], stage_of[j])) return false;
                                     --pending;   // compute recorded the slot's release event before any reuse
                                 }
+                            }
+                            if (!pf_here.empty()) {   // this set's slots are read: the layer after next may refill them
+                                cudaEventRecord(pf_used[pf_here_buf], m.cs);
+                                pf_used_live[pf_here_buf] = true;
+                            }
+                            // local STRATA_PREFILL_PF_NEXT: the next layer's likeliest non-resident experts, queued on the copy
+                            // stream behind this layer's own copies
+                            if (pf_pred && use_mmq && lay.native) {
+                                const int64_t ln = l + 1;
+                                std::vector<int32_t> pc((size_t) m.g->n_expert, 0);
+                                for (int64_t i = 0; i < T * K; ++i) {
+                                    const int32_t e = pf_ids_h[(size_t) i];
+                                    if (e >= 0 && e < m.g->n_expert) ++pc[(size_t) e];
+                                }
+                                std::vector<std::pair<int32_t, int32_t>> cand;   // (-tokens, expert)
+                                for (int32_t e = 0; e < m.g->n_expert; ++e)
+                                    if (pc[(size_t) e] > 0 && m.host_res[(size_t) ln * m.g->n_expert + e] < 0 && m.src->pinned(ln, e))
+                                        cand.emplace_back(-pc[(size_t) e], e);
+                                std::sort(cand.begin(), cand.end());
+                                const int buf = (int) (ln & 1);
+                                const int base = m.n_stage - 2 * pf_p + buf * pf_p;
+                                if (pf_used_live[buf]) cudaStreamWaitEvent(m.copy, pf_used[buf], 0);
+                                pfn_dev.assign((size_t) m.g->n_expert, nullptr);
+                                int n = 0;
+                                for (size_t i = 0; i < cand.size() && n < pf_p; ++i) {
+                                    const int32_t e = cand[i].second;
+                                    const uint8_t* b = m.src->blob_stable(ln, e);
+                                    if (b == nullptr) continue;
+                                    cudaMemcpyAsync(m.stage_dev[base + n], b, (size_t) lay.blob_bytes(ln), cudaMemcpyHostToDevice, m.copy);
+                                    pfn_dev[(size_t) e] = m.stage_dev[base + n];
+                                    stats_.bytes_streamed += (int64_t) lay.blob_bytes(ln);
+                                    ++n;
+                                }
+                                cudaEventRecord(pf_done[buf], m.copy);
+                                if (n > 0) { pfn_layer = ln; pfn_buf = buf; } else pfn_dev.clear();
                             }
                         } else {
                             // the streamed walk: this layer's entries [k, kend) in id order; an entry the routing did not

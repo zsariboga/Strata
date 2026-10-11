@@ -35,6 +35,8 @@ struct PrefillStats {
     int64_t experts_streamed = 0;   ///< expert blobs copied host -> device
     int64_t experts_dma = 0;        ///< ...of which straight from the pinned arena (no CPU copy)
     int64_t bytes_streamed = 0;     ///< local: the bytes of the streamed blobs (STRATA_PREFILL_STATS)
+    int64_t experts_pf = 0;         ///< local STRATA_PREFILL_PF_NEXT: prefetched blobs the routing used
+    int64_t experts_pf_waste = 0;   ///< ...and those it did not
     int64_t experts_resident = 0;   ///< expert-layer groups served from the VRAM tier
     int64_t experts_cpu = 0;        ///< ...computed on the CPU pool instead of streamed (STRATA_PREFILL_CPU_SHARE)
     double cpu_share = 0;           ///< ...the share of the streamed ones it took last (measured by default)

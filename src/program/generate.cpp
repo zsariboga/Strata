@@ -12571,12 +12571,13 @@ int main(int argc, char** argv) {
                 static strata::prefill::PrefillStats prev{};
                 const strata::prefill::PrefillStats& ps = sp.stats();
                 std::fprintf(stderr, "strata serve: prompt experts: streamed %lld (DMA %lld, %.2f GB, %.1f GB/s over the read), resident %lld, "
-                                     "on the CPU %lld (share %.2f), batched tokens %lld, host staging %.1f ms\n",
+                                     "on the CPU %lld (share %.2f), batched tokens %lld, host staging %.1f ms, prefetched %lld (unused %lld)\n",
                              (long long) (ps.experts_streamed - prev.experts_streamed), (long long) (ps.experts_dma - prev.experts_dma),
                              (double) (ps.bytes_streamed - prev.bytes_streamed) / 1e9,
                              prompt_ms > 0 ? (double) (ps.bytes_streamed - prev.bytes_streamed) / 1e6 / prompt_ms : 0.0,
                              (long long) (ps.experts_resident - prev.experts_resident), (long long) (ps.experts_cpu - prev.experts_cpu),
-                             ps.cpu_share, (long long) (ps.tokens - prev.tokens), ps.ms_experts_host - prev.ms_experts_host);
+                             ps.cpu_share, (long long) (ps.tokens - prev.tokens), ps.ms_experts_host - prev.ms_experts_host,
+                             (long long) (ps.experts_pf - prev.experts_pf), (long long) (ps.experts_pf_waste - prev.experts_pf_waste));
                 prev = ps;
             }
             // the VRAM share of the experts the pool looked up while decoding; experts it sent over PCIe for the GPU
