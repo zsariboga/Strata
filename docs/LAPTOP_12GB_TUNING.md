@@ -1,6 +1,6 @@
 # Tuning Strata on a 12 GB laptop: 55 → 140 tok/s
 
-This fork's `main` branch is the exact engine and server I run every day on a gaming laptop. It is Strata
+This fork's `laptop-12gb` branch is the exact engine and server I run every day on a gaming laptop. It is Strata
 v0.1.43 plus some community PRs that are not merged upstream, plus a few local changes. Everything here was measured
 on one machine over five days (4–8 October 2026). The 7–8 October work is in "Since 0.1.40.1" and "Since 0.1.40.3" below. Most of the local changes are opt-in switches, and with them off
 the engine behaves like the code it sits on.
