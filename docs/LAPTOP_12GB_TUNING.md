@@ -1,17 +1,19 @@
-# Tuning Strata on a 12 GB laptop: 55 → 140 tok/s
+# Tuning Strata on a 12 GB laptop: 55 → 145 tok/s
 
 This fork's `laptop-12gb` branch is the exact engine and server I run every day on a gaming laptop. It is Strata
 v0.1.43 plus some community PRs that are not merged upstream, plus a few local changes. Everything here was measured
-on one machine over five days (4–8 October 2026). The 7–8 October work is in "Since 0.1.40.1" and "Since 0.1.40.3" below. Most of the local changes are opt-in switches, and with them off
+on one machine over eight days (4–11 October 2026). The later work is in "Since 0.1.40.1", "Since 0.1.40.3" and "Since 0.1.41" below. Most of the local changes are opt-in switches, and with them off
 the engine behaves like the code it sits on.
 
-![55 → 105 tok/s on a 12 GB laptop](img/laptop-12gb-55-105.png)
+![55 → 145 tok/s on a 12 GB laptop](img/laptop-12gb-55-145.png)
 
-![0.1.41 on the 12 GB laptop, vision on](img/laptop-12gb-0141-poster.png)
+![0.1.43 on the 12 GB laptop: decode, prompt reads and long context](img/laptop-12gb-0143-infographic.png)
 
 **The short version:** on the same 30-question set, generation went from **55 tok/s** (stock 0.1.38 release) to
-**~105 tok/s**, and on 8 October to **~118 tok/s** (engine decode rate, temperature 1.0). Turkish chat answers went
-from ~68 to ~94, then ~100 tok/s. The set still answers 30/30. A long agent task
+**~105 tok/s** on 6 October, **~118 tok/s** on 8 October and **~145 tok/s** on 11 October (engine decode rate,
+temperature 1.0). Coding prompts run at ~127 tok/s, Turkish chat answers went from ~68 to ~123 tok/s, prompt reads
+reach 2,289 tok/s, and decode stays at 112-115 tok/s (best runs) at 116K-154K tokens of context. The set answers
+30/30 (29/30 in one later run at T=1.0). A long agent task
 (write, build and test an assembly GUI program in opencode) passed 6/6 checks twice with 0 broken tool calls.
 
 The biggest step is CAR (cache-aware routing, from PR #1017). It is **lossy**: it swaps a missed expert for one that
