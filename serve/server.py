@@ -5581,6 +5581,12 @@ def make_handler(svc: Service):
                 extra = svc.mcp.template_tools(exclude=own)       # the request's own tools win a name clash
                 use_mcp = bool(extra)
                 tools = (tools or []) + extra or None
+                # local: "tool_hints" for the web app's MCP tools too (they join after the request's own conversion)
+                import serve.frontend as _fe
+                if _fe.TOOL_HINTS and tools and (not messages or messages[0].get("role") != "system"):
+                    messages = [{"role": "system", "content": _fe.TOOL_HINTS_TEXT.strip()}] + list(messages)
+                else:
+                    messages = _fe._tool_hints(messages, tools)
             if force and use_mcp:
                 raise ValueError("a forced tool_choice with MCP tools is not supported")
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
@@ -6590,6 +6596,22 @@ def main() -> int:
     if not isinstance(recovery, bool):
         raise SystemExit(f"[strata] config \"tool_call_recovery\" must be true or false, not {recovery!r}")
     svc.tool_call_recovery = recovery
+    etu = cfg.get("env_to_user", False)                # local opt-in: see frontend._env_to_user
+    if not isinstance(etu, bool):
+        raise SystemExit(f"[strata] config \"env_to_user\" must be true or false, not {etu!r}")
+    import serve.frontend as _frontend
+    _frontend.ENV_TO_USER = etu
+    th = cfg.get("tool_hints", False)                  # local opt-in: see frontend._tool_hints
+    if not (isinstance(th, bool) or (isinstance(th, list) and all(isinstance(k, str) for k in th))):
+        raise SystemExit(f"[strata] config \"tool_hints\" must be true, false or a list of rule names, not {th!r}")
+    unknown = [k for k in th if k not in _frontend.TOOL_HINT_RULES] if isinstance(th, list) else []
+    if unknown:
+        raise SystemExit(f"[strata] config \"tool_hints\": unknown rule(s) {unknown}; known: {list(_frontend.TOOL_HINT_RULES)}")
+    _frontend.set_tool_hints(th)
+    lf = cfg.get("lsp_filter", False)                  # local opt-in: see frontend._lsp_filter
+    if not isinstance(lf, bool):
+        raise SystemExit(f"[strata] config \"lsp_filter\" must be true or false, not {lf!r}")
+    _frontend.LSP_FILTER = lf
     rs = cfg.get("repeat_stop_tokens", REPEAT_STOP_TOKENS)   # #606: opt-out with 0
     if isinstance(rs, bool) or not isinstance(rs, int) or rs < 0:
         raise SystemExit(f"[strata] config \"repeat_stop_tokens\" must be a whole number >= 0 (0 = off), not {rs!r}")
