@@ -379,7 +379,7 @@ TOOL_HINT_RULES = {
     "chain": "Chain build, run and test into one shell command when you can.",
     "fix_all": "When fixing errors, fix every known problem in one turn, then run the tests once.",
     "small_edits": "Change an existing file with small edits; do not rewrite the whole file to fix a few lines.",
-    "no_extras": "Build only what was asked; do not add features the task did not request.",
+    "no_extras": "Build only what was asked; do not add features or extra files (solutions, demos, docs) the task did not request.",
     "test_early": "Right after writing code, run a short test or the program once before writing more.",
     # from the local model's opencode history (307 sessions): 233 unchanged re-runs, 174 shell wrappers, 87 blocked
     # reads/writes outside the working directory
@@ -387,6 +387,12 @@ TOOL_HINT_RULES = {
     "no_wrap": "Do not wrap a command in another shell (powershell -Command, cmd /c, bash -c) unless it needs that shell.",
     "workspace": "Keep reads and writes inside the working directory and put scratch files there too, not in system temp "
                  "folders, unless the user gave another path.",
+    # 2026-10-12: a hard task's dead ends (a Thompson NFA that never ran, "regex module installed" six times, tests edited to pass)
+    "simple_first": "Start with the simplest approach that meets the task; use a complex algorithm only when the task needs it.",
+    "fallback": "If an approach still fails after two fix attempts, stop patching it: step back and switch to a simpler or "
+                "different method.",
+    "keep_tests": "Never change a test's expected values or remove tests to make your code pass; check the expected value "
+                  "independently first and change it only when it is provably wrong.",
 }
 
 
