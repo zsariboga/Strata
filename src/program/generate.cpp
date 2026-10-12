@@ -1904,6 +1904,45 @@ static double ple_direct_rows_per_s(strata::kernels::PleTable& t) {
     return el > 0 ? (double) done / el : -1.0;
 }
 
+// local (MTP training data, STRATA_MTP_DUMP=<path>): the prompt path's final multi-stream residual rows, appended as
+// records of int64 position, int32 token, int32 next token, then hc*n_embd BF16 (round to nearest even).  The teacher
+// distribution is computed offline from the same rows (mtp-refit/teacher.py), so nothing else is read back here.
+static std::FILE* mtp_dump_file() {
+    static std::FILE* f = [] {
+        const char* p = std::getenv("STRATA_MTP_DUMP");
+        return p != nullptr ? std::fopen(p, "ab") : nullptr;
+    }();
+    return f;
+}
+
+static bool mtp_dump_rows(const float* R_dev, int64_t rows, size_t hd, int64_t pos0, const int32_t* tok,
+                          const int32_t* nxt, std::string& err) {
+    std::FILE* f = mtp_dump_file();
+    if (f == nullptr || rows <= 0) return true;
+    std::vector<float> rf((size_t) rows * hd);
+    if (cudaMemcpy(rf.data(), R_dev, rf.size() * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) {
+        err = "STRATA_MTP_DUMP: the residual copy failed";
+        return false;
+    }
+    std::vector<uint16_t> rb(hd);
+    for (int64_t t = 0; t < rows; ++t) {
+        const float* r = rf.data() + (size_t) t * hd;
+        for (size_t i = 0; i < hd; ++i) {
+            uint32_t u;
+            std::memcpy(&u, &r[i], 4);
+            u += 0x7FFFu + ((u >> 16) & 1u);
+            rb[i] = (uint16_t) (u >> 16);
+        }
+        const int64_t pos = pos0 + t;
+        const int32_t tk[2] = {tok[t], nxt[t]};
+        std::fwrite(&pos, sizeof pos, 1, f);
+        std::fwrite(tk, sizeof tk, 1, f);
+        std::fwrite(rb.data(), 2, hd, f);
+    }
+    std::fflush(f);
+    return true;
+}
+
 int main(int argc, char** argv) {
     // **UNBUFFERED, BECAUSE THE INTERESTING OUTPUT IS THE OUTPUT BEFORE A CRASH.**  `stdout` redirected to a
     // pipe or a file is block-buffered, so a program that dies loses every line it had already printed - which
@@ -8433,6 +8472,11 @@ int main(int argc, char** argv) {
         sp.on_chunk = [&](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
             std::vector<int32_t> nxt((size_t) T);
             for (int64_t t = 0; t < T; ++t) nxt[(size_t) t] = (int32_t) cur[(size_t) (p0 + t + 1)];
+            if (mtp_dump_file() != nullptr) {   // local STRATA_MTP_DUMP: the fast (prompt path) MTP training dump
+                std::vector<int32_t> tk((size_t) T);
+                for (int64_t t = 0; t < T; ++t) tk[(size_t) t] = (int32_t) cur[(size_t) (p0 + t)];
+                if (!mtp_dump_rows(R_rows, T, (size_t) g.hc_dim(), p0, tk.data(), nxt.data(), e)) return false;
+            }
             // E-9: batched through the prompt path when it can (a layer split: only with STRATA_SPLIT_MTP_BATCH=1)
             bool batched = false;
             const strata::program::draft_kv::Plan dkv = strata::program::draft_kv::plan(
