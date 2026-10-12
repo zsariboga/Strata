@@ -1,17 +1,18 @@
-# Tuning Strata on a 12 GB laptop: 55 → 145 tok/s
+# Tuning Strata on a 12 GB laptop: 55 → 147 tok/s
 
 This fork's `laptop-12gb` branch is the exact engine and server I run every day on a gaming laptop. It is Strata
 v0.1.43 plus some community PRs that are not merged upstream, plus a few local changes. Everything here was measured
-on one machine over eight days (4–11 October 2026). The later work is in "Since 0.1.40.1", "Since 0.1.40.3" and "Since 0.1.41" below. Most of the local changes are opt-in switches, and with them off
+on one machine over nine days (4–12 October 2026). The later work is in "Since 0.1.40.1", "Since 0.1.40.3", "Since 0.1.41" and "12 October: MTP head v2" below. Most of the local changes are opt-in switches, and with them off
 the engine behaves like the code it sits on.
 
 ![55 → 145 tok/s on a 12 GB laptop](img/laptop-12gb-55-145.png)
 
-![0.1.43 on the 12 GB laptop: decode, prompt reads and long context](img/laptop-12gb-0143-infographic.png)
+![0.1.43 + MTP head v2 on the 12 GB laptop: decode, prompt reads and long context](img/laptop-12gb-mtpv2-infographic.png)
 
 **The short version:** on the same 30-question set, generation went from **55 tok/s** (stock 0.1.38 release) to
-**~105 tok/s** on 6 October, **~118 tok/s** on 8 October and **~145 tok/s** on 11 October (engine decode rate,
-temperature 1.0). Coding prompts run at ~127 tok/s, Turkish chat answers went from ~68 to ~123 tok/s, prompt reads
+**~105 tok/s** on 6 October, **~118 tok/s** on 8 October, **~145 tok/s** on 11 October and **~147 tok/s** on 12 October
+(engine decode rate, temperature 1.0). Short coding prompts run at ~130 tok/s and real opencode agent turns (26K-40K tokens
+of context) at ~117 tok/s; Turkish chat answers went from ~68 to ~127 tok/s, prompt reads
 reach 2,289 tok/s, and decode stays at 112-115 tok/s (best runs) at 116K-154K tokens of context. The set answers
 30/30 (29/30 in one later run at T=1.0). A long agent task
 (write, build and test an assembly GUI program in opencode) passed 6/6 checks twice with 0 broken tool calls.
@@ -478,6 +479,30 @@ compress (IQ formats: lzma ratio 1.00).
 
 MTP ceiling (`STRATA_SPEC_HIST`, research branch): 3.02 tokens per window now. A perfect drafter at the same window
 sizes would give 3.60, so training a better MTP head can add at most +19%.
+
+## 12 October: MTP head v2
+
+A second re-fit of the MTP draft head, this time on the model's own output. Lossless (only the drafts change; the main
+model still checks every token).
+
+- **Data:** 2,025 prompts answered by the live model (1.5M generated tokens, 4 samples each), plus the earlier opencode
+  history. A fast dump hook (`STRATA_MTP_DUMP`, in the serve prompt path) writes the main model's last hidden rows: 5.34M
+  rows in a night instead of ~0.45M. The target distribution (top-20) comes from the model's own output head applied in
+  PyTorch (`teacher.py`; it matches the engine's top-1 99.7%).
+- **Training:** LK loss (λ·KL + (1−λ)·TV, λ = exp(−3α)), depth weights 0.6^d, AdamW 5e-5, one epoch (555 steps, 2.1 h on the
+  laptop GPU), resumable checkpoints. Checkpoints are picked on held-out opencode sessions dumped through the decode path,
+  so the prompt-path dump cannot flatter the result.
+- **Offline (held-out, accepted tokens per round):** sampled 1.652 → 1.751 (+6.0%), greedy 1.945 → 2.105 (+8.2%).
+- **Agent set** (32 real opencode turns, mirrored order old/new/new/old): 112.7 / 115.1 → 116.9 / 118.6 tok/s, **+3.4%**
+  (pairs +3.7% / +3.0%).
+- **30-question set** after a clean reboot: 143.5 (old head) → 147.3 / 145.8 tok/s; Turkish 124 → 127, short coding 124 → 130.
+
+PRs measured the same day: #2039 (a literal `</tool_call>` in a prompt no longer ends the answer) is merged here.
+#2058 (`STRATA_EXPDEC`) and #2059 (`STRATA_QSA_ROWS`) are bit-exact on this card, but together they gave +2.6% on short
+questions and −1.6% / −5.8% on Turkish / coding answers (both mirrored pairs), about −0.7% overall, so they are not used.
+#2016 (QSA top-k) showed no measurable change at these prompt lengths. An offline check of cutting the last draft row
+when its CPU expert misses cost more than its expected token (after "The Limits of Speculation", arXiv 2609.22156) gave
+a ceiling of 0.1-0.2% and was dropped.
 
 ## Reproducing
 
