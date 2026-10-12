@@ -3620,6 +3620,16 @@ int tail_skip_rank() {
     return r;
 }
 void set_tail_skip_rank(int r) { g_tail_skip_rank.store(r > 0 && r < 10 ? r : 0, std::memory_order_relaxed); }
+// local: STRATA_ROUTE_TAIL_SKIP_MAP=<one digit per layer> (changes the output; after project-maya's TRUNK_KEEP_MAP):
+// the tail skip's rank per layer, '0' = off for that layer; layers past the map's end are off.  Set, it replaces
+// STRATA_ROUTE_TAIL_SKIP's single rank for every layer.
+static int tail_skip_rank_at(int64_t layer) {
+    static const std::string map = [] { const char* v = std::getenv("STRATA_ROUTE_TAIL_SKIP_MAP"); return std::string(v ? v : ""); }();
+    if (map.empty()) return tail_skip_rank();
+    if (layer < 0 || layer >= (int64_t) map.size()) return 0;
+    const char c = map[(size_t) layer];
+    return c >= '1' && c <= '9' ? c - '0' : 0;
+}
 
 void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
                                 float* out) {
@@ -3691,7 +3701,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         // STRATA_ROUTE_TAIL_SKIP=R (default 7 on CUDA serve, =0 off; changes the output): a missed expert that EVERY token of the window routes
         // only at rank >= R (the smallest weights of the top-10) is neither copied nor computed; its contribution is
         // zero, without renormalisation (the others keep the weight the router gave them).  Less PCIe and CPU work.
-        const int tail_rank = tail_skip_rank();
+        const int tail_rank = tail_skip_rank_at(d.layers);
         bool skip_d[kMaxWindowEntries];
         for (int q = 0; q < nd; ++q) skip_d[q] = false;
         if (tail_rank > 0 && d.peer == nullptr && d.remote_count == 0) {
