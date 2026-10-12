@@ -242,9 +242,11 @@ THINK_TAGS = {"<think>": "\U000F0E01", "</think>": "\U000F0E02"}
 # the same special ids, so text with <|vision_start|><|image_pad|> before a picture took that picture's embeddings
 VISION_TAGS = {"<|vision_start|>": "\U000F0E03", "<|image_pad|>": "\U000F0E04", "<|vision_end|>": "\U000F0E05",
                "<|video_pad|>": "\U000F0E06"}
-LITERAL_TAGS = {**THINK_TAGS, **VISION_TAGS}
+# #2026: a tool closer quoted in message text is data; only the template's own closer is a special token.
+TOOL_LITERAL_TAGS = {"</tool_call>": "\U000F0E07"}
+LITERAL_TAGS = {**THINK_TAGS, **VISION_TAGS, **TOOL_LITERAL_TAGS}
 THINK_MARKS = {v: k for k, v in LITERAL_TAGS.items()}
-CONTROL_MARK0 = 0xF0E10      # the control tokens' marks start here, clear of the two sets above
+CONTROL_MARK0 = 0xF0E10      # the control tokens' marks start here, clear of the sets above
 
 
 def literal_tags(controls) -> dict[str, str]:
@@ -284,7 +286,7 @@ def _has_tag(v, tags: dict[str, str] = LITERAL_TAGS) -> bool:
 
 
 def mark_think_literals(messages: list[dict], tools: list[dict] | None, tags: dict[str, str] = LITERAL_TAGS):
-    """#537: (messages, tools) with every literal <think> / </think> (#554: and vision marker) in their text swapped for
+    """#537: (messages, tools) with literal thinking tags, vision markers (#554), and tool closers (#2026) swapped for
     LITERAL_TAGS' marks (or `tags`': literal_tags() adds the control tokens' texts), and
     whether there was one (None: no change, the same objects back - a prompt without them renders as it always did).
     An assistant message whose content opens with a whole <think>...</think> block (clients that send the reasoning
@@ -311,7 +313,7 @@ _THINK_MARK_RE = re.compile("|".join(THINK_MARKS))
 
 
 def unmark_think_literals(prompt: str, tags: dict[str, str] = LITERAL_TAGS) -> tuple[str, list[tuple[int, int]]]:
-    """The rendered prompt with THINK_TAGS' marks turned back into the tags' text, and the (start, end) spans of those
+    """The rendered prompt with literal marks turned back into the tags' text, and the (start, end) spans of those
     tags in it: the server encodes them as ordinary text (the tokenizer's encode_plain_spans)."""
     marks = THINK_MARKS if tags is LITERAL_TAGS else {v: k for k, v in tags.items()}
     mark_re = _THINK_MARK_RE if tags is LITERAL_TAGS else re.compile("|".join(map(re.escape, marks)))
