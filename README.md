@@ -5,7 +5,7 @@
 > [docs/LAPTOP_12GB_TUNING.md](docs/LAPTOP_12GB_TUNING.md). The upstream project is
 > [Niko1221/Strata](https://github.com/Niko1221/Strata).
 >
-> **Ready-made package:** [laptop-12gb v0.1.43 release](https://github.com/zsariboga/Strata/releases/tag/laptop-12gb-v0.1.43) - the engine (RTX 30/40/50), the re-fit MTP draft head and a config script: install Strata with Swift 1.5 IQ3_XXS, unpack, run `apply_laptop12gb.py`.
+> **Ready-made package:** [laptop-12gb v0.1.43 + MTP head v2 release](https://github.com/zsariboga/Strata/releases/tag/laptop-12gb-v0.1.43-mtp2) - the engine (RTX 30/40/50), the MTP draft head v2 and a config script: install Strata with Swift 1.5 IQ3_XXS, unpack, run `apply_laptop12gb.py`.
 
 **English** · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [Deutsch](README.de.md) · [Français](README.fr.md) · [Español](README.es.md) · [Português](README.pt-BR.md)
 

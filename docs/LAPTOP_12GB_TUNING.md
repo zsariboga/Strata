@@ -495,6 +495,7 @@ model still checks every token).
 - **Offline (held-out, accepted tokens per round):** sampled 1.652 → 1.751 (+6.0%), greedy 1.945 → 2.105 (+8.2%).
 - **Agent set** (32 real opencode turns, mirrored order old/new/new/old): 112.7 / 115.1 → 116.9 / 118.6 tok/s, **+3.4%**
   (pairs +3.7% / +3.0%).
+- **Package:** [laptop-12gb-v0.1.43-mtp2 release](https://github.com/zsariboga/Strata/releases/tag/laptop-12gb-v0.1.43-mtp2) (same engine, MTP head v2).
 - **30-question set** after a clean reboot: 143.5 (old head) → 147.3 / 145.8 tok/s; Turkish 124 → 127, short coding 124 → 130.
 
 PRs measured the same day: #2039 (a literal `</tool_call>` in a prompt no longer ends the answer) is merged here.
