@@ -366,6 +366,117 @@ def _env_to_user(messages: list[dict]) -> list[dict]:
     return messages
 
 
+# local (config "tool_hints", opt-in): a short, fixed note at the end of the system message of every request that declares
+# tools, for any harness (opencode, DeepSeek Harness, ...).  The model used one tool call per turn even for independent
+# reads, listed empty folders and opened task lists for one-file jobs; every extra turn is a prompt read plus a new answer.
+# Fixed text at a fixed place: the prefix cache keeps working.  No tool names, since every harness names its tools differently.
+TOOL_HINTS = False
+# the rules by key, in this order; config "tool_hints": true (all) or a list of keys (the loader's agent discipline window)
+TOOL_HINT_RULES = {
+    "parallel": "Call independent tools together in one response (for example read or search several files at once) instead of one per turn.",
+    "no_listing": "Do not run a command only to list an empty working directory or to learn what the environment details already say.",
+    "no_todo": "For a small single-file task, do not use a todo or task list tool.",
+    "chain": "Chain build, run and test into one shell command when you can.",
+    "fix_all": "When fixing errors, fix every known problem in one turn, then run the tests once.",
+    "small_edits": "Change an existing file with small edits; do not rewrite the whole file to fix a few lines.",
+    "no_extras": "Build only what was asked; do not add features the task did not request.",
+    "test_early": "Right after writing code, run a short test or the program once before writing more.",
+    # from the local model's opencode history (307 sessions): 233 unchanged re-runs, 174 shell wrappers, 87 blocked
+    # reads/writes outside the working directory
+    "no_repeat": "Do not run the same command again unchanged; if it gives the same error twice, change the approach.",
+    "no_wrap": "Do not wrap a command in another shell (powershell -Command, cmd /c, bash -c) unless it needs that shell.",
+    "workspace": "Keep reads and writes inside the working directory and put scratch files there too, not in system temp "
+                 "folders, unless the user gave another path.",
+}
+
+
+def tool_hints_text(keys) -> str:
+    """The note for the chosen rule keys (True = all), '' when none."""
+    keys = list(TOOL_HINT_RULES) if keys is True else [k for k in TOOL_HINT_RULES if k in (keys or [])]
+    return "\n\n# Tool use efficiency\n" + "\n".join("- " + TOOL_HINT_RULES[k] for k in keys) if keys else ""
+
+
+TOOL_HINTS_TEXT = tool_hints_text(True)
+
+
+def set_tool_hints(value) -> None:
+    """config "tool_hints": true / false / a list of rule keys"""
+    global TOOL_HINTS, TOOL_HINTS_TEXT
+    TOOL_HINTS_TEXT = tool_hints_text(value if value is True else (value or []))
+    TOOL_HINTS = bool(TOOL_HINTS_TEXT)
+
+
+def _tool_hints(messages: list[dict], tools) -> list[dict]:
+    if not TOOL_HINTS or not tools or not messages or messages[0].get("role") != "system":
+        return messages
+    sys_text = messages[0].get("content")
+    if not isinstance(sys_text, str) or TOOL_HINTS_TEXT in sys_text:
+        return messages
+    out = list(messages)
+    out[0] = dict(messages[0], content=sys_text.rstrip("\n") + TOOL_HINTS_TEXT)
+    return out
+
+
+# local (config "lsp_filter", opt-in): opencode appends its language server's diagnostics to a write/edit result as
+# "LSP errors detected in this file, please fix:" + <diagnostics>.  Across our agent logs 76% of those lines were type
+# inference notes ("None is not subscriptable", tuple sizes) and 9% unresolved local imports; the model took them for
+# real errors and rewrote whole files (one regex task: 11 rewrites of a 30K-character file, ~2 min each).  Dropped: only
+# the known type-inference and unresolved-import notes (Pyright's wording); every other line stays, so another language
+# server's syntax errors ("';' expected", clangd, ...) are never lost.  The header asks for small edits.  Deterministic,
+# so the prefix cache keeps working.
+LSP_FILTER = False
+_LSP_BLOCK = re.compile(r"\n*LSP errors detected in (this file|other files), please fix:\n(<diagnostics[^>]*>)(.*?)(</diagnostics>)", re.S)
+_LSP_DROP = re.compile(r'Type "|type "|cannot be assigned|is not a known attribute|Argument of type|is not assignable|'
+                       r'Cannot access attribute|Operator "[^"]*" not supported|is not iterable|is incompatible|No overloads for|'
+                       r'is not subscriptable|Object of type "None"|could not be resolved|is obscured by a declaration|'
+                       r'Expression of type|Return type|is not awaitable|Cannot assign to attribute')
+_LSP_KEEP = type("_Keep", (), {"search": staticmethod(lambda s: _LSP_DROP.search(s) is None)})()
+
+
+def _lsp_filter_text(text: str) -> str:
+    def one(m):
+        kept, last = [], False
+        for line in m.group(3).split("\n"):
+            s = line.strip()
+            if s.startswith(("ERROR", "WARN", "INFO", "HINT")):
+                last = bool(_LSP_KEEP.search(s))
+                if last:
+                    kept.append(line)
+            elif s and last:
+                kept.append(line)                           # a kept note's continuation line
+        if not kept:
+            return ""
+        return ("\n\nPossible syntax errors from the static checker (fix them with small edits; do not rewrite the file):\n"
+                + m.group(2) + "\n" + "\n".join(kept) + "\n" + m.group(4))
+    return _LSP_BLOCK.sub(one, text)
+
+
+def _lsp_filter(messages: list[dict]) -> list[dict]:
+    if not LSP_FILTER:
+        return messages
+    out = None
+    for i, m in enumerate(messages):
+        c = m.get("content")
+        if m.get("role") != "tool" and not (m.get("role") == "user" and isinstance(c, list)):
+            continue
+        if isinstance(c, str) and "LSP errors detected" in c:
+            nc = _lsp_filter_text(c)
+        elif isinstance(c, list) and any(isinstance(p, dict) and "LSP errors detected" in str(p.get("text") or p.get("content") or "") for p in c):
+            nc = []
+            for p in c:
+                if isinstance(p, dict) and isinstance(p.get("text"), str):
+                    p = dict(p, text=_lsp_filter_text(p["text"]))
+                elif isinstance(p, dict) and isinstance(p.get("content"), str):
+                    p = dict(p, content=_lsp_filter_text(p["content"]))
+                nc.append(p)
+        else:
+            continue
+        if out is None:
+            out = list(messages)
+        out[i] = dict(m, content=nc)
+    return out if out is not None else messages
+
+
 def _late_system_to_user(messages: list[dict]) -> list[dict]:
     """The chat template takes a system message only at the start ("System message must be at the beginning").
     Clients also send them mid-conversation - Claude Code's hook context as {"role": "system"} after the first user
@@ -503,7 +614,7 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
             kwargs = {"enable_thinking": False}
         elif k == "reasoning_effort" and "enable_thinking" not in kwargs:
             kwargs.update(effort_kwargs(v))
-    return _env_to_user(_late_system_to_user(messages)), tools, kwargs
+    return _tool_hints(_lsp_filter(_env_to_user(_late_system_to_user(messages))), tools), tools, kwargs
 
 
 BILLING_HEADER = "x-anthropic-billing-header:"
@@ -599,7 +710,7 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
         # A config's reasoning_effort still applies: Service.with_shared sets output_config before this runs.  A
         # request that gives its own reasoning_budget_tokens (#123) asks for thinking, so it thinks as before.
         kwargs["enable_thinking"] = False
-    return _env_to_user(_late_system_to_user(messages)), tools, kwargs
+    return _tool_hints(_lsp_filter(_env_to_user(_late_system_to_user(messages))), tools), tools, kwargs
 
 
 # ------------------------------------------------------------------------------------------------ output parser
