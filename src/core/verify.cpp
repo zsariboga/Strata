@@ -182,6 +182,11 @@ const bool g_trace = env_on("STRATA_VERIFY_TRACE");
 // dev STRATA_NO_PCIE_GROUP=1 (with --pcie-frac 0): the window graph has no PCIe-share stage (flag B wait, staging copy,
 // grouped launch): with no share they only ever see zero groups
 const bool g_no_pcie_group = env_on("STRATA_NO_PCIE_GROUP");
+// local STRATA_EXPERT_DEFER=1 (KTransformers' expert deferral, changes the output): a layer's CPU experts are not waited
+// for; the GPU combines the layer without them and runs on, and their rows (with that layer's weights) are added to the
+// next layer's MoE output.  The pool works on layer l while the GPU does layer l+1's mixer and router.  The last layer
+// waits as before.  Only the plain window (one group, host plan, no helper GPU, no profile).
+const bool g_defer = env_on("STRATA_EXPERT_DEFER");
 const bool g_no_multi_gr = env_on("STRATA_NO_MULTI_GR");   // #783 PR-g: per-token GR reads/writes and generic-T kernels again
 const bool g_no_batch_kv = env_on("STRATA_NO_BATCH_KV_STEP");   // #783 PR-d: per-token K/V and indexer appends again
 
@@ -517,7 +522,7 @@ Verifier::~Verifier() {
         if (e) cudaEventDestroy(e);
     if (arena_) cudaFree(arena_);
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_commit_, h_ple_, h_out_, h_x_, h_ids_, h_w_, h_seq_, h_flag_, h_ymiss_,
-                     h_flagA_, h_plan_, h_flagB_, h_plan_err_, h_car_, h_nf_};
+                     h_flagA_, h_plan_, h_flagB_, h_plan_err_, h_car_, h_nf_, h_x2_, h_ids2_, h_w2_, h_ymiss2_, h_car2_};
     for (void* h : hosts)
         if (h) cudaFreeHost(h);
 }
@@ -628,6 +633,12 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
               // or the trace probe), so a run with neither allocates nothing extra.
               (publish_scores_ ? mapped(T * (int64_t) g.n_expert * 4, (void**) &h_car_, (void**) &m_car_) : true);
     if (!ok) { err = "verify: mapped staging allocation failed"; return false; }
+    if (g_defer) {
+        ok = mapped(T * N * 4, (void**) &h_x2_, (void**) &m_x2_) && mapped(T * K * 4, (void**) &h_ids2_, (void**) &m_ids2_) &&
+             mapped(T * K * 4, (void**) &h_w2_, (void**) &m_w2_) && mapped(T * K * N * 4, (void**) &h_ymiss2_, (void**) &m_ymiss2_) &&
+             (publish_scores_ ? mapped(T * (int64_t) g.n_expert * 4, (void**) &h_car2_, (void**) &m_car2_) : true);
+        if (!ok) { err = "verify: mapped staging allocation failed (STRATA_EXPERT_DEFER)"; return false; }
+    }
     // the GPU plan: counts(4) | start(cap+1) | dst(cap) | tok(cap) | pad | ptr(cap u64) | ptr2(cap u64) | start2(cap+1)
     {
         const int64_t cap = (int64_t) (T * K);
@@ -676,6 +687,11 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         shared_ = b.take<float>(T * N); parts_ = b.take<float>(T * K * N); hit_out_ = b.take<float>(T * K * N);
         hit_slot_ = b.take<int32_t>(T * K); hit_dst_ = b.take<int32_t>(T * K); hit_count_ = b.take<int32_t>(4);
         plan_ = b.take<int32_t>(2 * ((uint64_t) plan_i32_ + 16));
+        if (g_defer) {
+            w_def_ = b.take<float>(T * K); parts_def_ = b.take<float>(T * K * N);
+            d_def_ = b.take<float>(T * N); zero_def_ = b.take<float>(T * N);   // the arena is zeroed once below
+            pl_def_ = b.take<int32_t>((uint64_t) plan_i32_ + 16);
+        }
         staging_ = b.take<uint8_t>((uint64_t) kStagingBlobs * strata::kernels::cpu::expert_layout().max_blob);
         hit_xq_ = b.take<uint8_t>(T * (N / 32) * 34); hit_xs_ = b.take<float>(T * (N / 32));
         nat_xq_ = b.take<uint8_t>(T * (N / 32) * 36);
@@ -855,6 +871,18 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         if (trace_m_ != nullptr) gpu_stamp(trace_m_, (int) ((l * kProfPer + i) * 2 + grp), cs);   // #649
     };
     const int tb_[2] = {0, (T + 1) / 2}, te_[2] = {G == 2 ? (T + 1) / 2 : T, T};
+    // STRATA_EXPERT_DEFER: odd layers (from lb_) publish into the second doorbell set, so the GPU can write layer l+1's
+    // rows while the pool still reads layer l's
+    const bool defer = g_defer && G == 1 && !batch_rec_ && !device_plan_ && !remote_opt_ && !always_publish_ && !prof_on_ &&
+                       !ar_on() && dec_batch && strata::kernels::cpu::expert_layout().native && le_ == g.n_layers &&
+                       w_def_ != nullptr && h_x2_ != nullptr;
+    defer_on_ = defer;
+    auto odd = [&](int64_t l) { return defer && (((l - lb_) & 1) != 0); };
+    auto MX = [&](int64_t l) { return odd(l) ? m_x2_ : m_x_; };
+    auto MIDS = [&](int64_t l) { return odd(l) ? m_ids2_ : m_ids_; };
+    auto MW = [&](int64_t l) { return odd(l) ? m_w2_ : m_w_; };
+    auto MCAR = [&](int64_t l) { return odd(l) ? m_car2_ : m_car_; };
+    auto MYMISS = [&](int64_t l) { return odd(l) ? m_ymiss2_ : m_ymiss_; };
     // S26 STRATA_LFUSE=1: where the shared expert's gate / scale fusions apply (the paths they replace are the ones taken)
     auto lfuse_on = [&](int n) {
         return g_lfuse() && ar_on() && native_moe_combine_enabled() && dec_batch && n > 1 && n <= 8 &&
@@ -1508,26 +1536,26 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                               (uint32_t) ((l - lb_) * G + grp + 1), cs);
 #if defined(STRATA_USE_HIP)
             if (g_doorbell_store)   // #649 A/B: the step's ring stored, not incremented over PCIe
-                doorbell_publish_value(xm, ids_ + tb * K, w_ + tb * K, (int64_t) n * N, (int64_t) n * K, m_x_ + tb * N,
-                                       m_ids_ + tb * K, m_w_ + tb * K, m_seq_, (uint32_t) ((l - lb_) * G + grp + 1), cs);
+                doorbell_publish_value(xm, ids_ + tb * K, w_ + tb * K, (int64_t) n * N, (int64_t) n * K, MX(l) + tb * N,
+                                       MIDS(l) + tb * K, MW(l) + tb * K, m_seq_, (uint32_t) ((l - lb_) * G + grp + 1), cs);
             else
 #endif
             // #578: the helper GPUs reduce with the routing weights - publish them; set_always_publish: the rows
             // whatever the device's residency table says (pipelined windows)
             if (remote_opt_ || always_publish_)
-                doorbell_publish(xm, ids_ + tb * K, w_ + tb * K, (int64_t) n * N, (int64_t) n * K, m_x_ + tb * N,
-                                 m_ids_ + tb * K, m_w_ + tb * K, m_seq_, cs);
+                doorbell_publish(xm, ids_ + tb * K, w_ + tb * K, (int64_t) n * N, (int64_t) n * K, MX(l) + tb * N,
+                                 MIDS(l) + tb * K, MW(l) + tb * K, m_seq_, cs);
             else {
                 const int32_t* layer_res = hits_.d_res != nullptr ? (hits_.d_res + l * g.n_expert) : nullptr;
                 // `publish_scores_` adds the group's weights and its whole router score row to the same
                 // publication (cache-aware routing needs both; the ring is still the last thing the kernel does,
                 // so a host that sees it knows every byte above is in place).  Off: the identical call to before.
                 doorbell_publish_res(xm, ids_ + tb * K, layer_res, (int) g.n_expert, (int64_t) n * N, (int64_t) n * K,
-                                     m_x_ + tb * N, m_ids_ + tb * K, m_seq_, cs,
+                                     MX(l) + tb * N, MIDS(l) + tb * K, m_seq_, cs,
                                      publish_scores_ ? (w_ + tb * K) : nullptr,
-                                     publish_scores_ ? (m_w_ + tb * K) : nullptr,
+                                     publish_scores_ ? (MW(l) + tb * K) : nullptr,
                                      publish_scores_ ? (logits_ + tb * NE) : nullptr,
-                                     publish_scores_ ? (m_car_ + (int64_t) tb * g.n_expert) : nullptr,
+                                     publish_scores_ ? (MCAR(l) + (int64_t) tb * g.n_expert) : nullptr,
                                      publish_scores_ ? (int64_t) n * g.n_expert : 0);
             }
             if (sh_fork_late) {
@@ -1617,6 +1645,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             }
         };
         bool hits_in_combine = false;
+        const bool defer_l = defer && l != le_ - 1;   // STRATA_EXPERT_DEFER: the last layer waits for its own rows
         if (ar_on()) {
             stamp(l, 19, grp);
             grouped(p_ptr, p_start, p_counts, 0, parts_out);
@@ -1651,27 +1680,32 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             grouped(p_ptr2, p_start2, p_counts + 2, kPcieGroupRows, hit_out);
             }
             stamp(l, 22, grp);
-            if (device_plan_) {   // no CPU share when the device planned the group: its rows are zeros
+            if (defer_l) {   // STRATA_EXPERT_DEFER: the CPU rows come with the next layer; keep this layer's plan and weights
+                cudaMemsetAsync(parts_out, 0, (size_t) n * K * N * sizeof(float), cs);
+                cudaMemcpyAsync(pl_def_, pl, (size_t) (plan_i32_ + 16) * sizeof(int32_t), cudaMemcpyDeviceToDevice, cs);
+                cudaMemcpyAsync(w_def_, w_ + tb * K, (size_t) n * K * sizeof(float), cudaMemcpyDeviceToDevice, cs);
+                stamp(l, 23, grp);
+            } else if (device_plan_) {   // no CPU share when the device planned the group: its rows are zeros
                 wait_flag_ge_or(m_flag_, ring, skip_ + grp, cs);
-                copy_or_zero_from_mapped(parts_out, m_ymiss_ + (size_t) tb * K * N, (long long) n * K * N,
+                copy_or_zero_from_mapped(parts_out, MYMISS(l) + (size_t) tb * K * N, (long long) n * K * N,
                                          skip_ + grp, ring, cs);
             } else {
                 const bool fuse_rows = fuse_wait_on() && !prof_on_ && !remote_opt_ && dec_batch;   // 143-amdk
                 if (!fuse_rows) wait_flag_ge(m_flag_, ring, cs);               // the CPU's share is in the mapped rows
                 stamp(l, 23, grp);
                 if (remote_opt_)   // #578: the helper's rows come back reduced; skip them as well
-                    remote_opt_->copy_rows(parts_out, m_ymiss_ + (size_t) tb * K * N, tb, n, p_dst, p_counts + 1, cs);
+                    remote_opt_->copy_rows(parts_out, MYMISS(l) + (size_t) tb * K * N, tb, n, p_dst, p_counts + 1, cs);
                 else if (fuse_rows)   // the wait folded into the copy's blocks
-                    copy_rows_from_mapped_after(m_flag_, ring, parts_out, m_ymiss_ + (size_t) tb * K * N, (int64_t) n * K, N,
+                    copy_rows_from_mapped_after(m_flag_, ring, parts_out, MYMISS(l) + (size_t) tb * K * N, (int64_t) n * K, N,
                                                 p_dst, p_counts + 1, cs);
                 else if (dec_batch)   // only the CPU rows cross PCIe (p_dst[0, counts[1]) = the GPU's own rows)
-                    copy_rows_from_mapped(parts_out, m_ymiss_ + (size_t) tb * K * N, (int64_t) n * K, N,
+                    copy_rows_from_mapped(parts_out, MYMISS(l) + (size_t) tb * K * N, (int64_t) n * K, N,
                                           p_dst, p_counts + 1, cs);
                 else
-                    copy_from_mapped(parts_out, m_ymiss_ + (size_t) tb * K * N, (int64_t) n * K * N, cs);
+                    copy_from_mapped(parts_out, MYMISS(l) + (size_t) tb * K * N, (int64_t) n * K * N, cs);
             }
             // 143-amdk: the add of the GPU's hit rows is done by the combine that follows (one launch fewer)
-            hits_in_combine = fuse_hits_on() && !prof_on_ && !remote_opt_ && !sg_gated_[grp] && dec_batch && n > 1 &&
+            hits_in_combine = !defer_l && fuse_hits_on() && !prof_on_ && !remote_opt_ && !sg_gated_[grp] && dec_batch && n > 1 &&
                               native_moe_combine_enabled() && n <= 8 &&
                               native_moe_combine_hits_supported(parts_ + (size_t) tb * K * N, shared_ + tb * N, bo_ + tb * N, N, K, n);
             if (!hits_in_combine) moe_hit_add(parts_out, hit_out, p_dst, p_counts + 1, cap, N, cs);
@@ -1701,6 +1735,21 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             MoEBuffers mb = ss.moe;
             mb.weights = w_ + t * K; mb.shared = shared_ + t * N;
             if (!moe_combine_parts(g, l, K, mb, parts_ + (size_t) t * K * N, bo_ + t * N, cs, err)) return false;
+        }
+        if (defer && l > lb_) {   // STRATA_EXPERT_DEFER: layer l-1's CPU rows, with its weights, onto this layer's MoE output
+            const int32_t* d_counts = pl_def_;
+            const int32_t* d_dst = pl_def_ + 4 + capx + 1;
+            wait_flag_ge(m_flag_, (uint32_t) ((l - 1 - lb_) * G + grp + 1), cs);
+            copy_rows_from_mapped(parts_def_, MYMISS(l - 1) + (size_t) tb * K * N, (int64_t) n * K, N, d_dst, d_counts + 1, cs);
+            try {
+                if (n > 1 && native_moe_combine_enabled())
+                    native_moe_combine_multi(parts_def_, w_def_, zero_def_, d_def_, N, K, n, cs);
+                else
+                    for (int t = 0; t < n; ++t)
+                        native_moe_combine(parts_def_ + (size_t) t * K * N, w_def_ + t * K, zero_def_ + t * N, d_def_ + t * N,
+                                           N, K, cs);
+            } catch (const std::exception& e) { err = "verify deferred combine: " + std::string(e.what()); return false; }
+            add_inplace(bo_ + tb * N, d_def_, (int64_t) n * N, cs);
         }
         if (remote_opt_) remote_opt_->combine(bo_ + tb * N, y_dummy_ + tb * N, tb, n,
                               device_plan_ ? skip_ + grp : nullptr, ring, cs);
@@ -2275,13 +2324,20 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         // ---- CACHE-AWARE ROUTING, BEFORE the pool and before the plan: the hook may replace an uncached pick
         // in `h_ids_` with a resident expert, and everything downstream (the pool's miss list, the GPU plan, the
         // combine) then reads ONE list.  It is the same contract `hits` has, one phase earlier.
+        // STRATA_EXPERT_DEFER: odd layers (from lb_) use the second doorbell set (see record_window)
+        const bool odd_l = defer_on_ && (((l - lb_) & 1) != 0);
+        float* const hx = odd_l ? h_x2_ : h_x_;
+        int32_t* const hids = odd_l ? h_ids2_ : h_ids_;
+        float* const hw = odd_l ? h_w2_ : h_w_;
+        float* const hcar = odd_l ? h_car2_ : h_car_;
+        float* const hymiss = odd_l ? h_ymiss2_ : h_ymiss_;
         if (car_fn_ != nullptr)
-            car_fn_(car_user_, h_ids_ + (size_t) tb * ss.k, h_w_ + (size_t) tb * ss.k,
-                    h_car_ + (size_t) tb * g.n_expert, n, ss.k, l);
-        if (remote_opt_) remote_opt_->begin(h_w_ + (size_t) tb * ss.k, tb, n);
+            car_fn_(car_user_, hids + (size_t) tb * ss.k, hw + (size_t) tb * ss.k,
+                    hcar + (size_t) tb * g.n_expert, n, ss.k, l);
+        if (remote_opt_) remote_opt_->begin(hw + (size_t) tb * ss.k, tb, n);
         if (pool != nullptr)
-            pool(user, h_x_ + (size_t) tb * g.n_embd, h_ids_ + (size_t) tb * ss.k, n, ss.k,
-                 h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l);
+            pool(user, hx + (size_t) tb * g.n_embd, hids + (size_t) tb * ss.k, n, ss.k,
+                 hymiss + (size_t) tb * ss.k * g.n_embd, l);
         if (remote_opt_) remote_opt_->end();
         if (g_no_pcie_group && *(volatile uint32_t*) h_flagA_ == want && sink_.counts != nullptr && sink_.counts[2] > 0) {
             std::fprintf(stderr, "strata verify: STRATA_NO_PCIE_GROUP=1 needs --pcie-frac 0 (layer %lld planned %d PCIe experts)\n",

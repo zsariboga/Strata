@@ -527,6 +527,13 @@ private:
     int groups_[9] = {};
     float* h_ymiss_ = nullptr;   float* m_ymiss_ = nullptr;     // T * k * n_embd
     float* h_car_ = nullptr;     float* m_car_ = nullptr;       // T * n_expert router scores (cache-aware routing)
+    // local STRATA_EXPERT_DEFER=1: the odd layers' doorbell rows and CPU rows (the GPU runs one layer ahead of the pool)
+    float* h_x2_ = nullptr;      float* m_x2_ = nullptr;
+    int32_t* h_ids2_ = nullptr;  int32_t* m_ids2_ = nullptr;
+    float* h_w2_ = nullptr;      float* m_w2_ = nullptr;
+    float* h_ymiss2_ = nullptr;  float* m_ymiss2_ = nullptr;
+    float* h_car2_ = nullptr;    float* m_car2_ = nullptr;
+    bool defer_on_ = false;      // the recorded windows defer the CPU experts' rows by one layer
     CarFn car_fn_ = nullptr;     void* car_user_ = nullptr;     // the host hook, once per group, before the pool
     bool publish_scores_ = false;
 
@@ -545,6 +552,9 @@ private:
     float* tail_snap_ = nullptr;                              // per QSA layer
     int32_t* sel_ = nullptr;
     float *logits_ = nullptr, *w_ = nullptr, *shared_ = nullptr, *parts_ = nullptr, *hit_out_ = nullptr;
+    // STRATA_EXPERT_DEFER: the deferred layer's weights, plan, CPU rows, its weighted sum and a zero shared row
+    float *w_def_ = nullptr, *parts_def_ = nullptr, *d_def_ = nullptr, *zero_def_ = nullptr;
+    int32_t* pl_def_ = nullptr;
     int32_t *ids_ = nullptr, *hit_slot_ = nullptr, *hit_dst_ = nullptr, *hit_count_ = nullptr;
     int32_t* plan_ = nullptr;                                     // device copy of the plan block
     uint8_t* staging_ = nullptr;                                  // VRAM slots for the PCIe share of the misses
