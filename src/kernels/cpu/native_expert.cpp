@@ -152,6 +152,20 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
         const char* v = std::getenv("STRATA_CPU_IQ_ALL_EXACT1");
         return v && v[0] == '1' && v[1] == '\0';
     }();
+    // local STRATA_CPU_REPACK_MIB: this expert's repacked copy, taken exactly where the original kernels below would run
+    // (the exact one-token rows, or the AVX-2 rows); the same bits (iq_avx2.hpp).  Anything else: the original paths.
+    if (avx2 && !cpu_avx512_ok()) {
+        if (const uint8_t* rp = cpu_repack_find(blob)) {
+            if (exact_one && nt == 1 && (f.gu_type == 16 || f.gu_type == 17 || f.gu_type == 18 || f.gu_type == 21)) {
+                iq256_gu_rows_rp_exact_one(f.gu_type, rp, (int) f.n_ff, (int) f.n_embd, act[0], ff[0], r0, r1);
+                return;
+            }
+            if (nt >= native_gu_mt_min(f.gu_type) && iq256_supported(f.gu_type) && iq256_repack_supported(f.gu_type)) {
+                iq256_gu_rows_rp(f.gu_type, rp, (int) f.n_ff, (int) f.n_embd, act, nt, ff, r0, r1);
+                return;
+            }
+        }
+    }
     if (exact_one && nt == 1 && avx2 && !cpu_avx512_ok() &&
         (f.gu_type == 16 || f.gu_type == 17 || f.gu_type == 18 || f.gu_type == 21)) {
         static std::once_flag announced;

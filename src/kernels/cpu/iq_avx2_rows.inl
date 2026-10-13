@@ -338,5 +338,101 @@ STRATA_ROWS_FN void iq4nl_nt(const uint8_t* w, size_t row_bytes, int n, const bl
     }
 }
 
+// ---- local STRATA_CPU_REPACK_MIB: the repacked gate/up rows (iq_avx2.hpp, kRepackBlockBytes).  Each 32-value half gives
+// back the decode's own g / sign / scale (two pshufb on the 4-bit codes, two scale bytes), so row_dot_rp is row_dot (and
+// row_dot_iq2xs: the same integer sums, the same h2f(d) * K * y.d) and row_dot_rp_one is row_dot_ggml_one, bit for bit.
+STRATA_ROWS_FN inline void rp_half(const uint8_t* blk, int H, __m256i maglut, __m256i& g, __m256i& sgn, __m256i& sc) {
+    const __m256i sgnlut = _mm256_setr_epi8(1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1, -1, -1, -1,
+                                            1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1, -1, -1, -1);
+    const __m128i x = _mm_loadu_si128((const __m128i*) (blk + 18 + 16 * H));
+    const __m256i c = _mm256_and_si256(_mm256_set_m128i(_mm_srli_epi16(x, 4), x), _mm256_set1_epi8(0x0f));
+    g = _mm256_shuffle_epi8(maglut, c);
+    sgn = _mm256_shuffle_epi8(sgnlut, c);
+    const __m128i s2 = _mm_cvtsi32_si128((int) u16(blk + 2 + 2 * H));
+    sc = _mm256_cvtepi8_epi16(_mm_shuffle_epi8(s2, _mm_setr_epi8(0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1)));
+}
+
+template <int NT> STRATA_ROWS_FN
+inline void row_dot_rp(const uint8_t* row, int nblocks, const block_q8_K* const* y, float* res, __m256i maglut, float K) {
+    __m256 accf[NT];
+    for (int t = 0; t < NT; ++t) accf[t] = _mm256_setzero_ps();
+    for (int i = 0; i < nblocks; ++i) {
+        const uint8_t* blk = row + (size_t) i * 146;
+        __m256i acci[NT];
+        for (int t = 0; t < NT; ++t) acci[t] = _mm256_setzero_si256();
+        for (int H = 0; H < 8; ++H) {
+            __m256i g, sgn, sc;
+            rp_half(blk, H, maglut, g, sgn, sc);
+            for (int t = 0; t < NT; ++t) {
+                const __m256i yv = _mm256_loadu_si256((const __m256i*) (y[t][i].qs + 32 * H));
+                acci[t] = madd_add(acci[t], _mm256_maddubs_epi16(g, _mm256_sign_epi8(yv, sgn)), sc);
+            }
+        }
+        const float dx = h2f(u16(blk)) * K;
+        for (int t = 0; t < NT; ++t)
+            accf[t] = _mm256_fmadd_ps(_mm256_set1_ps(dx * y[t][i].d), _mm256_cvtepi32_ps(acci[t]), accf[t]);
+    }
+    for (int t = 0; t < NT; ++t) res[t] = hsum8(accf[t]);
+}
+
+STRATA_ROWS_FN inline float row_dot_rp_one(const uint8_t* row, int nblocks, const block_q8_K* y, __m256i maglut, float K) {
+    __m256 accum = _mm256_setzero_ps();
+    for (int i = 0; i < nblocks; ++i) {
+        const uint8_t* blk = row + (size_t) i * 146;
+        __m256i sums[2] = {_mm256_setzero_si256(), _mm256_setzero_si256()};
+        for (int H = 0; H < 8; ++H) {
+            __m256i g, sgn, sc;
+            rp_half(blk, H, maglut, g, sgn, sc);
+            const __m256i act = _mm256_loadu_si256((const __m256i*) (y[i].qs + 32 * H));
+            sums[H & 1] = madd_add(sums[H & 1], _mm256_maddubs_epi16(g, _mm256_sign_epi8(act, sgn)), sc);
+        }
+        const float d = h2f(u16(blk)) * y[i].d;
+        accum = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(_mm256_add_epi32(sums[0], sums[1])), accum);
+    }
+    return K * ggml_hsum8(accum);
+}
+
+template <int NT> STRATA_ROWS_FN
+void gu_rows_rp(const uint8_t* rp, int rows_half, int n, const void* const* act, float* const* ff, int r0, int r1,
+                __m256i maglut, float K) {
+    const block_q8_K* y[NT];
+    for (int t = 0; t < NT; ++t) y[t] = (const block_q8_K*) act[t];
+    const int nb = n / QK_K;
+    const size_t row = (size_t) nb * 146;
+    float g[NT], u[NT];
+    for (int r = r0; r < r1; ++r) {
+        row_dot_rp<NT>(rp + (size_t) r * row, nb, y, g, maglut, K);
+        row_dot_rp<NT>(rp + (size_t) (rows_half + r) * row, nb, y, u, maglut, K);
+        for (int t = 0; t < NT; ++t) ff[t][r] = (g[t] / (1.f + std::exp(-g[t]))) * u[t];
+    }
+}
+
+STRATA_ROWS_FN
+void gu_rp_nt(int nt, const uint8_t* rp, int rows_half, int n, const void* const* act, float* const* ff, int r0, int r1,
+              __m256i maglut, float K) {
+    switch (nt) {
+        case 1: gu_rows_rp<1>(rp, rows_half, n, act, ff, r0, r1, maglut, K); break;
+        case 2: gu_rows_rp<2>(rp, rows_half, n, act, ff, r0, r1, maglut, K); break;
+        case 3: gu_rows_rp<3>(rp, rows_half, n, act, ff, r0, r1, maglut, K); break;
+        case 4: gu_rows_rp<4>(rp, rows_half, n, act, ff, r0, r1, maglut, K); break;
+        case 5: gu_rows_rp<5>(rp, rows_half, n, act, ff, r0, r1, maglut, K); break;
+        case 6: gu_rows_rp<6>(rp, rows_half, n, act, ff, r0, r1, maglut, K); break;
+        case 7: gu_rows_rp<7>(rp, rows_half, n, act, ff, r0, r1, maglut, K); break;
+        default: gu_rows_rp<8>(rp, rows_half, n, act, ff, r0, r1, maglut, K); break;
+    }
+}
+
+STRATA_ROWS_FN
+void gu_rp_one(const uint8_t* rp, int rows_half, int n, const block_q8_K* y, float* ff, int r0, int r1, __m256i maglut,
+               float K) {
+    const int nb = n / QK_K;
+    const size_t row = (size_t) nb * 146;
+    for (int r = r0; r < r1; ++r) {
+        const float g = row_dot_rp_one(rp + (size_t) r * row, nb, y, maglut, K);
+        const float u = row_dot_rp_one(rp + (size_t) (rows_half + r) * row, nb, y, maglut, K);
+        ff[r] = (g / (1.f + std::exp(-g))) * u;
+    }
+}
+
 #undef STRATA_ROWS_VNNI
 #undef STRATA_ROWS_FN

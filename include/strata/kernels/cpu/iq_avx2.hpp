@@ -7,6 +7,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 
 namespace strata::kernels::cpu {
 
@@ -48,5 +49,30 @@ void iq4nl256_down_rows(const uint8_t* w, size_t row_bytes, int n, const void* c
 /// The same in a given variant (only the kIq256Vnni bit matters here).
 void iq4nl256_down_rows_v(int variant, const uint8_t* w, size_t row_bytes, int n, const void* const* hq, int nt,
                           float* const* out, int r0, int r1);
+
+// ---- local STRATA_CPU_REPACK_MIB (opt-in): a CPU copy of an expert's gate/up rows in a 4-bit code layout.
+// Every 32-value half of an IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS / IQ3_S block keeps the decode's own magnitude bytes,
+// signs and scales (one signed 4-bit code per weight: a magnitude index | sign << 3, and two int8 scales per half), so the
+// kernels below sum the same integers in the same order and the rows come out bit for bit as the original kernels'.
+// Layout per 256 values: the block's fp16 d (2 B), 8 x 2 scale bytes, 8 x 16 code bytes (low nibbles values 0-15 of a
+// half, high nibbles 16-31) = 146 B.  The GPU keeps reading the original blob: this is an extra copy in RAM.
+constexpr int kRepackBlockBytes = 146;
+/// Whether `ggml_type`'s gate/up rows can be repacked (IQ2_XXS 16, IQ2_XS 17, IQ3_XXS 18, IQ3_S 21, IQ2_S 22).
+bool iq256_repack_supported(int ggml_type) noexcept;
+/// Repacks `rows` gate/up rows of `n` values (gate rows at `blob`, up rows at `blob + up_off`, `gu_row` bytes apart)
+/// into `out` (rows * (n / 256) * kRepackBlockBytes bytes: the gate rows, then the up rows).  False (with `err`)
+/// when a half does not fit the layout - then nothing may be registered for this blob.
+bool iq256_repack_gu(int ggml_type, const uint8_t* blob, size_t gu_row, size_t up_off, int rows, int n, uint8_t* out,
+                     std::string& err);
+/// Registers a repacked copy for the original blob pointer (before the pool runs; read-only afterwards).
+void cpu_repack_register(const uint8_t* blob, const uint8_t* repacked);
+/// The repacked copy registered for `blob`, or nullptr.
+const uint8_t* cpu_repack_find(const uint8_t* blob) noexcept;
+/// The repacked rows in the order of iq256_gu_rows (`rows_half`: gate rows; up rows follow), any token count.
+void iq256_gu_rows_rp(int ggml_type, const uint8_t* rp, int rows_half, int n, const void* const* act, int nt,
+                      float* const* ff, int r0, int r1);
+/// The same as iq256_gu_rows_exact_one (one token, ggml's float order), from the repacked rows.
+void iq256_gu_rows_rp_exact_one(int ggml_type, const uint8_t* rp, int rows_half, int n, const void* act, float* ff,
+                                int r0, int r1);
 
 }  // namespace strata::kernels::cpu

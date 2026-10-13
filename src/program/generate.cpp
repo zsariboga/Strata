@@ -44,6 +44,7 @@
 #include "strata/kernels/cpu/pool.hpp"
 #include "strata/platform/aux_cpus.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
+#include "strata/kernels/cpu/iq_avx2.hpp"
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
@@ -5099,6 +5100,61 @@ int main(int argc, char** argv) {
         }
 #endif
         srcp = &arena_src;
+    }
+    // local STRATA_CPU_REPACK_MIB=N (opt-in): a 4-bit code copy of the gate/up rows of the experts the CPU computes most,
+    // in N MiB of RAM beside the arena (the GPU keeps reading the arena's blobs).  The same bits (iq_avx2.hpp); IQ2_XS,
+    // IQ2_S, IQ3_XXS and IQ3_S (IQ2_XXS measured no faster).  Picked in the profile's order after its first
+    // STRATA_CPU_REPACK_SKIP pairs (default 3000: the ones the VRAM tier holds).
+    static std::unique_ptr<uint8_t[]> cpu_repack_mem;
+    if (const char* rm = std::getenv("STRATA_CPU_REPACK_MIB"); rm != nullptr && std::atoll(rm) > 0 && srcp == &arena_src &&
+        strata::kernels::cpu::cpu_avx2_ok() && !strata::kernels::cpu::cpu_avx512_ok()) {
+        const auto& lay = strata::kernels::cpu::expert_layout();
+        const char* sk = std::getenv("STRATA_CPU_REPACK_SKIP");
+        const size_t skip = sk ? (size_t) std::max(0LL, std::atoll(sk)) : 3000;
+        const uint64_t budget = (uint64_t) std::atoll(rm) << 20;
+        std::vector<std::pair<int32_t, int32_t>> pick;
+        std::vector<uint64_t> at;
+        uint64_t used = 0;
+        for (size_t r = skip; r < profile.size() && lay.native; ++r) {
+            const int32_t l = profile[r].first, e = profile[r].second;
+            if (l < 0 || l >= (int32_t) lay.fmt.size()) continue;
+            const auto& f = lay.fmt[(size_t) l];
+            if (!strata::kernels::cpu::iq256_repack_supported(f.gu_type) || f.gu_type == 16 || f.n_embd % 256 != 0) continue;
+            const uint64_t b = (uint64_t) 2 * (uint64_t) f.n_ff * (uint64_t) (f.n_embd / 256) * strata::kernels::cpu::kRepackBlockBytes;
+            if (used + b > budget) break;
+            pick.emplace_back(l, e);
+            at.push_back(used);
+            used += b;
+        }
+        if (!pick.empty()) {
+            const auto t0 = std::chrono::steady_clock::now();
+            cpu_repack_mem.reset(new uint8_t[used]);
+            std::vector<const uint8_t*> blobs(pick.size());
+            for (size_t i = 0; i < pick.size(); ++i) blobs[i] = arena_src.blob(pick[i].first, pick[i].second);
+            std::vector<char> ok(pick.size(), 0);
+            std::atomic<size_t> next{0};
+            const unsigned nth = std::max(1u, std::thread::hardware_concurrency());
+            std::vector<std::thread> th;
+            for (unsigned k = 0; k < nth; ++k)
+                th.emplace_back([&] {
+                    std::string e2;
+                    for (size_t i; (i = next.fetch_add(1)) < pick.size();) {
+                        const auto& f = lay.fmt[(size_t) pick[i].first];
+                        ok[i] = blobs[i] != nullptr &&
+                                strata::kernels::cpu::iq256_repack_gu(f.gu_type, blobs[i], f.gu_row, f.up_off, (int) f.n_ff,
+                                                                     (int) f.n_embd, cpu_repack_mem.get() + at[i], e2);
+                    }
+                });
+            for (auto& t : th) t.join();
+            size_t n_ok = 0;
+            for (size_t i = 0; i < pick.size(); ++i)
+                if (ok[i]) { strata::kernels::cpu::cpu_repack_register(blobs[i], cpu_repack_mem.get() + at[i]); ++n_ok; }
+            std::fprintf(stderr, "strata generate: STRATA_CPU_REPACK_MIB: %zu of %zu experts repacked for the CPU (%.2f GiB, "
+                         "profile ranks %zu-%zu) in %.1f s\n", n_ok, pick.size(), (double) used / 1073741824.0, skip,
+                         skip + pick.size(), std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+        } else {
+            std::fprintf(stderr, "strata generate: STRATA_CPU_REPACK_MIB: nothing to repack (no profile, or no repackable layer)\n");
+        }
     }
 #if defined(__linux__)
     // 0.1.43.1: on by default (STRATA_ADAPT_CALLBACK_WARMUP=0 turns it off).  Linux threads inherit the creator's CPU mask, and

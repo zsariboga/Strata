@@ -518,18 +518,90 @@ int bench(const std::vector<std::string>& pairs, const std::vector<int>& nts, in
     return 0;
 }
 
+#if !defined(STRATA_IQ_PARITY_DISPATCH_ONLY)
+// local --repack: STRATA_CPU_REPACK_MIB's copies through native_gu_rows.  For each repackable format: every token count's
+// gate/up rows from the original blobs, then the blobs repacked and registered, the same rows again - bit for bit - and
+// the time per expert of both (the same `mb` of experts, the weights streaming from DRAM).  Memory stays allocated to the
+// end so no registered pointer is ever reused by another blob.
+int repack_mode(const std::vector<int>& nts, int mb, int reps) {
+    int failures = 0;
+    static std::vector<std::unique_ptr<uint8_t[]>> keep;
+    for (int type : {16, 17, 22, 18, 21}) {
+        cpu::NativeFmt f;
+        std::string err;
+        if (!cpu::native_fmt(type, 20, kH, kFF, f, err)) return 1;
+        const size_t E = std::max<size_t>(16, ((size_t) mb << 20) / f.bytes);
+        keep.emplace_back(new uint8_t[E * f.bytes + 64]);
+        uint8_t* blobs = (uint8_t*) (((uintptr_t) keep.back().get() + 63) & ~(uintptr_t) 63);
+        uint64_t seed = 0x7e9a0000ull + (uint64_t) type;
+        for (size_t e = 0; e < E; ++e) fill_blob(blobs + e * f.bytes, f, seed);
+        const Acts a(f, 29u + (unsigned) type);
+        const size_t R = (size_t) kFF;
+        const size_t S = std::min<size_t>(E, 12);
+        std::vector<float> want(S * kMaxT * kMaxT * R), got(want.size());
+        auto run_all = [&](std::vector<float>& o) {
+            for (size_t e = 0; e < S; ++e)
+                for (int nt = 1; nt <= kMaxT; ++nt) {
+                    float* fp[kMaxT];
+                    for (int t = 0; t < nt; ++t) fp[t] = &o[((e * kMaxT + (nt - 1)) * kMaxT + t) * R];
+                    cpu::native_gu_rows(f, blobs + e * f.bytes, a.gup, nt, fp, 0, (int) kFF);
+                }
+        };
+        std::vector<float> ffb(kMaxT * R);
+        float* ff[kMaxT];
+        for (int t = 0; t < kMaxT; ++t) ff[t] = &ffb[(size_t) t * R];
+        auto time_nt = [&](int nt) {
+            std::vector<double> ms;
+            for (int k = 0; k < reps; ++k) {
+                const auto t0 = std::chrono::steady_clock::now();
+                for (size_t e = 0; e < E; ++e) cpu::native_gu_rows(f, blobs + e * f.bytes, a.gup, nt, ff, 0, (int) kFF);
+                ms.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / (double) E);
+            }
+            std::sort(ms.begin(), ms.end());
+            return ms[ms.size() / 2];
+        };
+        run_all(want);
+        std::vector<double> t_orig;
+        for (int nt : nts) t_orig.push_back(time_nt(nt));
+        const size_t rp_bytes = (size_t) 2 * kFF * (kH / 256) * cpu::kRepackBlockBytes;
+        keep.emplace_back(new uint8_t[E * rp_bytes]);
+        uint8_t* rps = keep.back().get();
+        size_t refused = 0;
+        for (size_t e = 0; e < E; ++e) {
+            if (cpu::iq256_repack_gu(type, blobs + e * f.bytes, f.gu_row, f.up_off, (int) kFF, (int) kH, rps + e * rp_bytes, err))
+                cpu::cpu_repack_register(blobs + e * f.bytes, rps + e * rp_bytes);
+            else if (refused++ == 0)
+                std::printf("  %-8s repack refused: %s\n", type_name(type), err.c_str());
+        }
+        run_all(got);
+        size_t differ = 0;
+        for (size_t i = 0; i < want.size(); i += R) differ += rows_differ(&got[i], &want[i], R);
+        std::printf("  %-8s repack: %zu of %zu experts (%.1f -> %.1f MB), 1..8 tokens: %zu gate/up rows differ\n", type_name(type),
+                    E - refused, E, (double) E * (f.down_off) / 1e6, (double) E * rp_bytes / 1e6, differ);
+        if (differ || refused) ++failures;
+        for (size_t k = 0; k < nts.size(); ++k) {
+            const double tr = time_nt(nts[k]);
+            std::printf("    %d tokens: %.3f -> %.3f ms per expert (gate/up)\n", nts[k], t_orig[k], tr);
+        }
+    }
+    std::printf("iq_avx2_parity --repack: %d failures\n", failures);
+    return failures ? 1 : 0;
+}
+#endif
+
 }  // namespace
 
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
-    bool do_bench = false, dispatch_only = !kVariants;
+    bool do_bench = false, do_repack = false, dispatch_only = !kVariants;
     int pin = -1, mb = 256, reps = 5;
     std::vector<int> nts = {1, 2, 3, 4};
     std::vector<std::string> pairs = {"iq3_s/iq4_nl", "iq3_xxs/iq4_nl", "iq2_s/q2_0", "iq2_xxs/q2_0"};
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         const bool more = i + 1 < argc;
-        if (a == "--bench") do_bench = true;
+        if (a == "--repack") do_repack = true;
+        else if (a == "--bench") do_bench = true;
         else if (a == "--dispatch") dispatch_only = true;
         else if (a == "--cpu" && more) pin = std::atoi(argv[++i]);
         else if (a == "--mb" && more) mb = std::atoi(argv[++i]);
@@ -564,6 +636,9 @@ int main(int argc, char** argv) {
 #if !defined(STRATA_IQ_PARITY_DISPATCH_ONLY)
     std::printf("  variants this CPU runs: %s; this thread's: %s\n",
                 variant_name(cpu::iq256_variants()).c_str(), variant_name(cpu::iq256_variant()).c_str());
+#endif
+#if !defined(STRATA_IQ_PARITY_DISPATCH_ONLY)
+    if (do_repack) return repack_mode(nts, mb, reps);
 #endif
     if (do_bench) return bench(pairs, nts, mb, reps, dispatch_only);
     int failures = 0;

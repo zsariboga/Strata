@@ -29,6 +29,9 @@
 
 #include <immintrin.h>
 
+#include <mutex>
+#include <unordered_map>
+#include <string>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -569,6 +572,136 @@ void iq4nl256_down_rows_v(int variant, const uint8_t* w, size_t row_bytes, int n
 void iq4nl256_down_rows(const uint8_t* w, size_t row_bytes, int n, const void* const* hq, int nt, float* const* out,
                         int r0, int r1) {
     iq4nl256_down_rows_v(vnni_on() ? kIq256Vnni : 0, w, row_bytes, n, hq, nt, out, r0, r1);
+}
+
+// ---- local STRATA_CPU_REPACK_MIB: the repacked gate/up copies (iq_avx2.hpp)
+namespace {
+
+struct RpType {
+    float K;
+    uint8_t mag[8];
+    int n;
+};
+const RpType* rp_type(int type) noexcept {
+    static const RpType iq2{0.125f, {8, 25, 43, 0, 0, 0, 0, 0}, 3};
+    static const RpType iq3xxs{0.25f, {4, 12, 20, 28, 36, 44, 52, 62}, 8};
+    static const RpType iq3s{1.0f, {1, 3, 5, 7, 9, 11, 13, 15}, 8};
+    switch (type) {
+        case 16: case 17: case 22: return &iq2;
+        case 18: return &iq3xxs;
+        case 21: return &iq3s;
+        default: return nullptr;
+    }
+}
+__m256i rp_maglut(const RpType& t) noexcept {
+    alignas(32) uint8_t l[32] = {0};
+    for (int k = 0; k < 8; ++k) l[k] = l[8 + k] = l[16 + k] = l[24 + k] = t.mag[k];   // the sign bit (code bit 3) leaves the magnitude
+    return _mm256_load_si256((const __m256i*) l);
+}
+
+template <int TY>
+bool repack_rows(const uint8_t* blob, size_t gu_row, size_t up_off, int rows, int n, uint8_t* out, std::string& err) {
+    const RpType& rt = *rp_type(TY);
+    int8_t idx_of[256];
+    std::memset(idx_of, -1, sizeof idx_of);
+    for (int k = 0; k < rt.n; ++k) idx_of[rt.mag[k]] = (int8_t) k;
+    const int nb = n / QK_K;
+    for (int part = 0; part < 2; ++part)
+        for (int r = 0; r < rows; ++r) {
+            const uint8_t* row = blob + (part ? up_off : 0) + (size_t) r * gu_row;
+            uint8_t* orow = out + ((size_t) part * rows + r) * (size_t) nb * kRepackBlockBytes;
+            for (int i = 0; i < nb; ++i) {
+                const uint8_t* blk = row + (size_t) i * Fmt32<TY>::bytes;
+                uint8_t* ob = orow + (size_t) i * kRepackBlockBytes;
+                std::memcpy(ob, blk, 2);
+                for (int j = 0; j < 4; ++j)
+                    for (int half = 0; half < 2; ++half) {
+                        __m256i g, sgn, sc;
+                        Fmt32<TY>::decode(blk, j, half, g, sgn, sc);
+                        alignas(32) uint8_t gb[32];
+                        alignas(32) int8_t sb[32];
+                        alignas(32) int16_t cb[16];
+                        _mm256_store_si256((__m256i*) gb, g);
+                        _mm256_store_si256((__m256i*) sb, sgn);
+                        _mm256_store_si256((__m256i*) cb, sc);
+                        const int H = 2 * j + half;
+                        for (int l = 1; l < 8; ++l)
+                            if (cb[l] != cb[0] || cb[8 + l] != cb[8]) { err = "repack: a half's scales are not two groups"; return false; }
+                        if (cb[0] < -128 || cb[0] > 127 || cb[8] < -128 || cb[8] > 127) { err = "repack: a scale does not fit int8"; return false; }
+                        ob[2 + 2 * H] = (uint8_t) (int8_t) cb[0];
+                        ob[3 + 2 * H] = (uint8_t) (int8_t) cb[8];
+                        uint8_t* codes = ob + 18 + 16 * H;
+                        for (int k = 0; k < 32; ++k) {
+                            const int m = idx_of[gb[k]];
+                            if (m < 0) { err = "repack: a magnitude outside the format's table"; return false; }
+                            if (sb[k] == 0) { err = "repack: a zero sign"; return false; }
+                            const uint8_t c = (uint8_t) (m | (sb[k] < 0 ? 8 : 0));
+                            if (k < 16) codes[k] = c;
+                            else codes[k - 16] = (uint8_t) (codes[k - 16] | (c << 4));
+                        }
+                    }
+            }
+        }
+    return true;
+}
+
+std::unordered_map<const uint8_t*, const uint8_t*>& rp_registry() {
+    static std::unordered_map<const uint8_t*, const uint8_t*> m;
+    return m;
+}
+bool& rp_any() {
+    static bool any = false;
+    return any;
+}
+
+}  // namespace
+
+bool iq256_repack_supported(int ggml_type) noexcept { return rp_type(ggml_type) != nullptr; }
+
+bool iq256_repack_gu(int type, const uint8_t* blob, size_t gu_row, size_t up_off, int rows, int n, uint8_t* out,
+                     std::string& err) {
+    if (n % QK_K != 0) { err = "repack: n is not a multiple of 256"; return false; }
+    switch (type) {
+        case 16: return repack_rows<16>(blob, gu_row, up_off, rows, n, out, err);
+        case 17: return repack_rows<17>(blob, gu_row, up_off, rows, n, out, err);
+        case 18: return repack_rows<18>(blob, gu_row, up_off, rows, n, out, err);
+        case 21: return repack_rows<21>(blob, gu_row, up_off, rows, n, out, err);
+        case 22: return repack_rows<22>(blob, gu_row, up_off, rows, n, out, err);
+        default: err = "repack: format not supported"; return false;
+    }
+}
+
+void cpu_repack_register(const uint8_t* blob, const uint8_t* repacked) {
+    rp_registry()[blob] = repacked;
+    rp_any() = true;
+}
+
+const uint8_t* cpu_repack_find(const uint8_t* blob) noexcept {
+    if (!rp_any()) return nullptr;
+    const auto& m = rp_registry();
+    const auto it = m.find(blob);
+    return it == m.end() ? nullptr : it->second;
+}
+
+void iq256_gu_rows_rp(int type, const uint8_t* rp, int rows_half, int n, const void* const* act, int nt, float* const* ff,
+                      int r0, int r1) {
+    const RpType& rt = *rp_type(type);
+    const __m256i lut = rp_maglut(rt);
+#if STRATA_AVXVNNI
+    if (vnni_on()) { vnni::gu_rp_nt(nt, rp, rows_half, n, act, ff, r0, r1, lut, rt.K); return; }
+#endif
+    plain::gu_rp_nt(nt, rp, rows_half, n, act, ff, r0, r1, lut, rt.K);
+}
+
+void iq256_gu_rows_rp_exact_one(int type, const uint8_t* rp, int rows_half, int n, const void* act, float* ff, int r0,
+                                int r1) {
+    const RpType& rt = *rp_type(type);
+    const __m256i lut = rp_maglut(rt);
+    const auto* y = (const block_q8_K*) act;
+#if STRATA_AVXVNNI
+    if (vnni_on()) { vnni::gu_rp_one(rp, rows_half, n, y, ff, r0, r1, lut, rt.K); return; }
+#endif
+    plain::gu_rp_one(rp, rows_half, n, y, ff, r0, r1, lut, rt.K);
 }
 
 }  // namespace strata::kernels::cpu
