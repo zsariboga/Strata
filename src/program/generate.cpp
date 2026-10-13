@@ -127,6 +127,7 @@
 #include <set>
 #include <vector>
 
+namespace strata::prefill { extern float* g_adapt_prompt_usage; extern float g_adapt_prompt_v; }
 namespace {
 // local (STRATA_THINK_BAN, opt-in, LOSSY - it changes what the model writes): "NoWait" (arXiv 2506.08343) - a few
 // token ids (the reflection openers: Wait, Hmm, Actually, Alternatively) get STRATA_THINK_BAN_BIAS (default -100)
@@ -8697,6 +8698,15 @@ int main(int argc, char** argv) {
         }
         if (o.adapt_every > 0 && o.adapt_swaps > 0 && !all_experts_resident)
             drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
+        if (!drive.d.usage.empty()) {   // local STRATA_ADAPT_PROMPT=V: prompt routing feeds the adaptive tier (prefill.cpp)
+            const char* v = std::getenv("STRATA_ADAPT_PROMPT");
+            if (v != nullptr && std::atof(v) > 0.0) {
+                strata::prefill::g_adapt_prompt_usage = drive.d.usage.data();
+                strata::prefill::g_adapt_prompt_v = (float) std::atof(v);
+                std::fprintf(stderr, "strata serve: STRATA_ADAPT_PROMPT: a prompt chunk adds %.1f tokens' worth of routing to the adaptive tier
+", std::atof(v));
+            }
+        }
         PcieAuto pcie_auto;
         if (o.pcie_frac_auto && !all_experts_resident && o.batch == 0 && o.peer_device < 0 && (n_stages == 1 || pcie_auto_split_ok())) {
             const auto& pl = strata::kernels::cpu::expert_layout();
@@ -13692,6 +13702,15 @@ int main(int argc, char** argv) {
         const uint64_t fbytes0 = src.file_blob_bytes(), fall0 = src.file_read_bytes();
         const double fms0 = src.file_ms();
         if (o.adapt_every > 0 && o.adapt_swaps > 0) drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
+        if (!drive.d.usage.empty()) {   // local STRATA_ADAPT_PROMPT=V: prompt routing feeds the adaptive tier (prefill.cpp)
+            const char* v = std::getenv("STRATA_ADAPT_PROMPT");
+            if (v != nullptr && std::atof(v) > 0.0) {
+                strata::prefill::g_adapt_prompt_usage = drive.d.usage.data();
+                strata::prefill::g_adapt_prompt_v = (float) std::atof(v);
+                std::fprintf(stderr, "strata: STRATA_ADAPT_PROMPT: a prompt chunk adds %.1f tokens' worth of routing to the adaptive tier
+", std::atof(v));
+            }
+        }
         // before every window: the device's table follows the host's (the tier's evictions while its copies are in
         // flight - see the serve path); the hook's captures live in this block, so it is taken off the verifier when the
         // block ends

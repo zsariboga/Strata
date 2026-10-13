@@ -99,6 +99,8 @@ void experts_native(const Batch&, const NativeGeom&, int, int64_t, const void*, 
 #endif
 
 namespace strata::prefill {
+float* g_adapt_prompt_usage = nullptr;   // local STRATA_ADAPT_PROMPT: generate.cpp points it at the adaptive tier's usage
+float g_adapt_prompt_v = 0.0f;
 namespace {
 
 using Clock = std::chrono::steady_clock;
@@ -3374,6 +3376,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             const int32_t e = ids_h[(size_t) i];
                             if (e < 0 || e >= m.g->n_expert) { err = "prefill: routed id out of range"; return false; }
                             ++m.cnt[(size_t) e];
+                        }
+                        // local STRATA_ADAPT_PROMPT=V (ADEPT idea): this chunk's routing goes into the adaptive tier's usage counts,
+                        // V virtual decode tokens' worth per chunk, so the first adaptation after a prompt fills the cache for it
+                        if (g_adapt_prompt_usage != nullptr && g_adapt_prompt_v > 0.0f && T > 0) {
+                            const float w = g_adapt_prompt_v / (float) T;
+                            float* u = g_adapt_prompt_usage + (size_t) l * (size_t) m.g->n_expert;
+                            for (int64_t e = 0; e < m.g->n_expert; ++e) if (m.cnt[(size_t) e] > 0) u[e] += w * (float) m.cnt[(size_t) e];
                         }
                         // local STRATA_PREFILL_PF_NEXT: the blobs the previous layer prefetched for this one
                         std::vector<const uint8_t*> pf_here;
