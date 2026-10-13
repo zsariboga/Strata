@@ -34,18 +34,14 @@ namespace {
 // epoch's cache line instead of spinning on _mm_pause.  It wakes when the host publishes (a write to that line) or
 // after the cycles, in the light C0.1 state; on a laptop the CPU then gives back the power the spin took, which the
 // GPU's share of the budget gets.  0 or unset (or no WAITPKG): the spin, unchanged.  STRATA_POOL_UMWAIT_C02=1: the
-// deeper C0.2 state (slower wake).
+// deeper C0.2 state (slower wake).  MSVC x64 only for now (the intrinsics need no target flag there); other builds spin.
 uint64_t umwait_cycles() {
     static const uint64_t c = [] {
         const char* e = std::getenv("STRATA_POOL_UMWAIT");
         if (e == nullptr || std::atoll(e) <= 0) return (uint64_t) 0;
-#if defined(_MSC_VER) && defined(_M_X64)
+#if defined(_MSC_VER) && defined(_M_X64) && !defined(__clang__)   // MSVC proper: clang-cl (the Windows HIP build) has no WAITPKG intrinsics by default
         int r[4] = {0, 0, 0, 0};
-#if defined(_MSC_VER)
         __cpuidex(r, 7, 0);
-#else
-        __cpuid_count(7, 0, r[0], r[1], r[2], r[3]);
-#endif
         if (((r[2] >> 5) & 1) == 0) {
             std::fprintf(stderr, "strata: STRATA_POOL_UMWAIT: this CPU has no WAITPKG, the workers spin\n");
             return (uint64_t) 0;
@@ -560,13 +556,13 @@ void ExpertPool::worker(int id) {
         const auto parked_at = std::chrono::steady_clock::now();
         uint32_t spins = 0;
         const uint64_t um = umwait_cycles();
-#if defined(_MSC_VER) && defined(_M_X64)
+#if defined(_MSC_VER) && defined(_M_X64) && !defined(__clang__)   // MSVC proper: clang-cl (the Windows HIP build) has no WAITPKG intrinsics by default
         const uint64_t um_esc = umwait_escalate();
         const uint64_t um_t0 = um != 0 && um_esc != 0 ? __rdtsc() : 0;
 #endif
         while (epoch_.load(std::memory_order_acquire) == seen) {
             if (stop_.load(std::memory_order_relaxed)) return;
-#if defined(_MSC_VER) && defined(_M_X64)
+#if defined(_MSC_VER) && defined(_M_X64) && !defined(__clang__)   // MSVC proper: clang-cl (the Windows HIP build) has no WAITPKG intrinsics by default
             if (um != 0) {   // STRATA_POOL_UMWAIT: wake on the publish's write to epoch_, or after `um` cycles
                 _umonitor((void*) &epoch_);
                 if (epoch_.load(std::memory_order_acquire) != seen) break;
@@ -789,7 +785,7 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
             }
         } else if (mode_ >= 5) {
             // plan v0.3 P6: native layers, 5 = gate/up rows, 6 = down rows
-            const int per = mode_ == 5 ? FF : H;
+            const int per = mode_ == 5 ? (int) nfmt_->n_ff : (int) nfmt_->n_embd;   // v0.1.44: the layer's own n_ff / n_embd
             int64_t g0 = mrows_ * (int64_t) i / mtasks_, g1 = mrows_ * (int64_t) (i + 1) / mtasks_;
             if (!g_guided.empty()) { g0 = g_guided[i]; g1 = g_guided[i + 1]; }   // local: STRATA_POOL_GUIDED
             for (int64_t r = g0; r < g1;) {
@@ -967,7 +963,7 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
         const int nb = (std::min)(kMaxSplitMulti, n - b0);
         mjobs_ = jobs + b0;
         nfmt_ = &f;
-        mrows_ = (int64_t) nb * FF;
+        mrows_ = (int64_t) nb * f.n_ff;
         mtasks_ = phase_tasks(mrows_);
         if (native_pipeline_) {
             for (int e = 0; e < nb; ++e) {
@@ -993,7 +989,7 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
         const auto b = std::chrono::steady_clock::now();
         for (int e = 0; e < nb; ++e) quant_native(e);
         const auto c = std::chrono::steady_clock::now();
-        mrows_ = (int64_t) nb * H;
+        mrows_ = (int64_t) nb * f.n_embd;
         mtasks_ = pool_guided_on() ? guided_bounds(mrows_, n_ + (host_works_ ? 1 : 0)) : phase_tasks(mrows_);
         run_phase(6, mtasks_);
         g_guided.clear();   // the next caller (another phase kind) splits evenly unless it builds its own

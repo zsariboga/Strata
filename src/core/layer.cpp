@@ -1,6 +1,7 @@
 
 // src/core/layer.cpp - the GDN layer, composed.  See the header for the operation order and its traps.
 #include "strata/core/layer.hpp"
+#include "strata/core/native_dense.hpp"
 #include "strata/core/native_head.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
@@ -502,9 +503,7 @@ bool moe_layer(const WeightTable& tables, const ModelGeometry& g, int64_t layer,
 if (!moe_route(tables, g, layer, k, b, x, stream, err, db)) return false;    return moe_finish(tables, g, layer, k, b, x, parts, out, stream, err);}
 // ================================ the QSA mixer ================================
 namespace {using strata::kernels::QsaIndexerBuffers;using strata::kernels::QsaShapes;
-/// The geometry the QSA kernels want, from the one place that defines it.  `ModelGeometry` carries the widths
-/// the LAYOUT needs; `QsaShapes` adds `n_rot`, `idx_block` and `idx_top_k`, which are kernel contracts.
-QsaShapes qsa_shapes(const ModelGeometry& g) {    QsaShapes s = strata::kernels::qsa_real_shapes();    s.n_head = g.n_head;    s.n_head_kv = g.n_head_kv;    s.head_dim = g.head_dim;    s.idx_n_head = g.idx_q_heads;    s.idx_dim = g.idx_key_dim;    return s;}
+// `qsa_shapes(g)` (layout.hpp): the geometry the QSA kernels want, every field from the model's geometry
 uint64_t align_up16(uint64_t n) { return (n + 15) & ~15ull; }
 /// One cursor over an arena, so every region is 16-byte aligned without a list of hand-added offsets.
 struct Cursor {    uint8_t* p;    uint64_t used = 0;    template <typename T>    T* take(uint64_t count) {        T* r = (T*) (p + used);        used = align_up16(used + count * sizeof(T));        return r;    }    uint8_t* take_bytes(uint64_t n) {        uint8_t* r = p + used;        used = align_up16(used + n);        return r;    }};
@@ -1397,7 +1396,8 @@ if (w_down[h]->kind != WeightKind::Bf16InF32 || w_up[h]->kind != WeightKind::Bf1
 // order before the read (4 staging buffers, ~26 MB), so the prompt path reads it from VRAM as before.
 const uint16_t* hc_dn[2] = {(const uint16_t*) w_down[0]->data, (const uint16_t*) w_down[1]->data};
 const uint16_t* hc_up[2] = {(const uint16_t*) w_up[0]->data, (const uint16_t*) w_up[1]->data};
-if (strata::core::hc_host_requested()) {
+// (v0.1.44: STRATA_HC_Q8 may leave no bf16 copy - data null; then hc_bf16_view dequantizes at the point of use)
+if (strata::core::hc_host_requested() && w_down[0]->data && w_down[1]->data && w_up[0]->data && w_up[1]->data) {
     static void* stage[4] = {nullptr, nullptr, nullptr, nullptr};
     static uint64_t stage_bytes[4] = {0, 0, 0, 0};
     for (int h = 0; h < 2; ++h) {
@@ -1432,12 +1432,12 @@ st_begin(layer, 0, stream);
     if (fused) {
         strata::kernels::FusedGrArgs fa;
         fa.R = R; fa.R_out = R; fa.apply = pending_ffn; fa.bo_prev = bb.block_out; fa.inj_prev = bb.inject2;
-        fa.w_norm = (const float*) w_norm[0]->data; fa.w_down = hc_dn[0];
-        fa.w_up = hc_up[0]; fa.w_inject = (const uint16_t*) w_inject[0]->data;
+        fa.w_norm = (const float*) w_norm[0]->data; fa.w_down = hc_dn[0] ? hc_dn[0] : NativeDense::hc_bf16_view(*w_down[0], stream, 0, 1);
+        fa.w_up = hc_up[0] ? hc_up[0] : NativeDense::hc_bf16_view(*w_up[0], stream, 1, 1); fa.w_inject = (const uint16_t*) w_inject[0]->data;
         fa.eps = RMS_EPS; fa.lo = bb.gr.lo; fa.rs = bb.gr_rs; fa.inject_out = bb.inject; fa.mixed = bb.mixed;
         strata::kernels::fused_gr_read(fa, stream);
     } else {
-    gr_read(R, (const float*) w_norm[0]->data, hc_dn[0],            hc_up[0], (const uint16_t*) w_inject[0]->data, RMS_EPS, gs, bb.gr, bb.mixed,            bb.inject, stream);
+    gr_read(R, (const float*) w_norm[0]->data, hc_dn[0] ? hc_dn[0] : NativeDense::hc_bf16_view(*w_down[0], stream, 0, 1),            hc_up[0] ? hc_up[0] : NativeDense::hc_bf16_view(*w_up[0], stream, 1, 1), (const uint16_t*) w_inject[0]->data, RMS_EPS, gs, bb.gr, bb.mixed,            bb.inject, stream);
     }
     st_end(layer, 0, stream);    dump_half(bb, g, layer, bb.inject, 2 * g.n_embd, g.hc, stream);        }
     if (run1) {
@@ -1455,12 +1455,12 @@ st_begin(layer, 3, stream);
     if (fused) {
         strata::kernels::FusedGrArgs fa;
         fa.R = R; fa.R_out = R; fa.apply = true; fa.bo_prev = bb.block_out; fa.inj_prev = bb.inject;
-        fa.w_norm = (const float*) w_norm[1]->data; fa.w_down = hc_dn[1];
-        fa.w_up = hc_up[1]; fa.w_inject = (const uint16_t*) w_inject[1]->data;
+        fa.w_norm = (const float*) w_norm[1]->data; fa.w_down = hc_dn[1] ? hc_dn[1] : NativeDense::hc_bf16_view(*w_down[1], stream, 0, 1);
+        fa.w_up = hc_up[1] ? hc_up[1] : NativeDense::hc_bf16_view(*w_up[1], stream, 1, 1); fa.w_inject = (const uint16_t*) w_inject[1]->data;
         fa.eps = RMS_EPS; fa.lo = bb.gr.lo; fa.rs = bb.gr_rs; fa.inject_out = bb.inject2; fa.mixed = bb.mixed;
         strata::kernels::fused_gr_read(fa, stream);
     } else {
-    gr_read(R, (const float*) w_norm[1]->data, hc_dn[1],            hc_up[1], (const uint16_t*) w_inject[1]->data, RMS_EPS, gs, bb.gr, bb.mixed,            bb.inject, stream);
+    gr_read(R, (const float*) w_norm[1]->data, hc_dn[1] ? hc_dn[1] : NativeDense::hc_bf16_view(*w_down[1], stream, 0, 1),            hc_up[1] ? hc_up[1] : NativeDense::hc_bf16_view(*w_up[1], stream, 1, 1), (const uint16_t*) w_inject[1]->data, RMS_EPS, gs, bb.gr, bb.mixed,            bb.inject, stream);
     }
     st_end(layer, 3, stream);        }
     if (run4) {

@@ -324,6 +324,31 @@ class ImageMarkers(unittest.TestCase):
                     self.assertIn("<|image_pad|> marks" if "docs" in text else "plain", tok.decode(ids))
             svc.embeddings.path.unlink(missing_ok=True)
 
+    def test_pictures_are_keyed_by_their_bytes_for_the_engine(self):
+        """#2228: each picture's key (its normalized bytes' hash: the encoder's file name) goes to the engine as
+        img_keys=, in prompt order, so the conversation cache does not depend on the embedding floats."""
+        import tempfile
+        tok = ByteTokenizer()
+        with tempfile.TemporaryDirectory() as d:
+            class Keyed(self.FakeVision):
+                def encode(self, source):
+                    p = self.dir / ("0123456789abcdef0123456789abcdef.sve" if source == "a.png" else
+                                    "fedcba9876543210fedcba9876543210.sve")
+                    p.write_bytes(b"rows")
+                    return p, 3
+            svc = Service(MockEngine(tok, "ok", max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"),
+                          vision=Keyed(d))
+            msgs = [{"role": "user", "content": [{"type": "image", "source": "b.png"}, {"type": "text", "text": "and"},
+                                                 {"type": "image", "source": "a.png"}]}]
+            svc.prepare(msgs, None, {})
+            self.assertEqual(svc.embeddings.keys, ["fedcba9876543210", "0123456789abcdef"])
+            svc.embeddings.path.unlink(missing_ok=True)
+        keys = StrataEngine.sampling_keys({"strata_img_keys": ["fedcba9876543210", "0123456789abcdef"]})
+        self.assertEqual(keys, " img_keys=fedcba9876543210,0123456789abcdef")
+        for bad in ([], ["XYZ"], ["ab cd"], "abc", [3]):   # never sent malformed: the engine falls back to the embeddings
+            with self.subTest(bad=bad):
+                self.assertNotIn("img_keys", StrataEngine.sampling_keys({"strata_img_keys": bad}))
+
     def test_anthropic_tool_result_image(self):
         """Claude Code's Read of a picture returns it inside a tool_result: it reaches the encoder, in place."""
         import tempfile
