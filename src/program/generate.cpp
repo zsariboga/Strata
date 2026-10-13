@@ -8703,8 +8703,7 @@ int main(int argc, char** argv) {
             if (v != nullptr && std::atof(v) > 0.0) {
                 strata::prefill::g_adapt_prompt_usage = drive.d.usage.data();
                 strata::prefill::g_adapt_prompt_v = (float) std::atof(v);
-                std::fprintf(stderr, "strata serve: STRATA_ADAPT_PROMPT: a prompt chunk adds %.1f tokens' worth of routing to the adaptive tier
-", std::atof(v));
+                std::fprintf(stderr, "strata serve: STRATA_ADAPT_PROMPT: a prompt chunk adds %.1f tokens' worth of routing to the adaptive tier\n", std::atof(v));
             }
         }
         PcieAuto pcie_auto;
@@ -13707,8 +13706,7 @@ int main(int argc, char** argv) {
             if (v != nullptr && std::atof(v) > 0.0) {
                 strata::prefill::g_adapt_prompt_usage = drive.d.usage.data();
                 strata::prefill::g_adapt_prompt_v = (float) std::atof(v);
-                std::fprintf(stderr, "strata: STRATA_ADAPT_PROMPT: a prompt chunk adds %.1f tokens' worth of routing to the adaptive tier
-", std::atof(v));
+                std::fprintf(stderr, "strata: STRATA_ADAPT_PROMPT: a prompt chunk adds %.1f tokens' worth of routing to the adaptive tier\n", std::atof(v));
             }
         }
         // before every window: the device's table follows the host's (the tier's evictions while its copies are in
