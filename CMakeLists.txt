@@ -1338,6 +1338,13 @@ if(STRATA_NATIVE_EXPERTS)
   endif()
   target_link_libraries(strata_kernels_cpu PUBLIC ggml-cpu ggml-base)
   target_compile_definitions(strata_kernels_cpu PUBLIC STRATA_NATIVE_EXPERTS=1)
+  # local: clang-cl (MSVC front end) needs the target features the MSVC /arch flags leave implicit; the paths stay
+  # runtime-dispatched on the CPU's cpuid as before
+  if(MSVC AND CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+    set_property(SOURCE src/kernels/cpu/expert.cpp APPEND PROPERTY COMPILE_OPTIONS "/clang:-mavx512vnni;/clang:-mavx512vbmi;/clang:-mavxvnni")
+    set_property(SOURCE src/kernels/cpu/iq_avx2.cpp src/kernels/cpu/q2_avx2.cpp APPEND PROPERTY COMPILE_OPTIONS "/clang:-mavxvnni")
+    set_property(SOURCE src/kernels/cpu/pool.cpp APPEND PROPERTY COMPILE_OPTIONS "/clang:-mwaitpkg")
+  endif()
   if(STRATA_BUILD_TESTS)
     # the Q5_1 block dequantizer (a Q5_1 PLE table) against ggml's, synthetic blocks: no model, no GPU
     add_executable(dequant_q5_1_test tests/core/dequant_q5_1_test.cpp)

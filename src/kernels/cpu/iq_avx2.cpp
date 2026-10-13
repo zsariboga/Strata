@@ -518,14 +518,38 @@ void iq256_rows_v(int variant, int type, const uint8_t* w, size_t row_bytes, int
     else plain::dot_type<false>(type, nt, w, row_bytes, n, act, out, r0, r1);
 }
 
+// local STRATA_IQ256_GATHER_SKIP=<ggml types, comma separated> (opt-in): those formats never take the gathered decode,
+// on any core.  On a Core Ultra 7 255HX P-core the gather is 13-25% faster for IQ3_S but 5-19% SLOWER for IQ3_XXS and
+// IQ2_S at 2, 4-8 tokens (iq_avx2_parity --bench); the per-core rule cannot see the format.  The same bits either way.
+static bool gather_skipped(int type) noexcept {
+    static const unsigned long long mask = [] {
+        unsigned long long m = 0;
+        const char* e = std::getenv("STRATA_IQ256_GATHER_SKIP");
+        for (const char* s = e; s != nullptr && *s;) {
+            char* end = nullptr;
+            const long v = std::strtol(s, &end, 10);
+            if (end == s) { ++s; continue; }
+            if (v >= 0 && v < 64) m |= 1ull << v;
+            s = end;
+        }
+        return m;
+    }();
+    return type >= 0 && type < 64 && ((mask >> type) & 1ull) != 0;
+}
+
+static int variant_for(int type) noexcept {
+    const int v = iq256_variant();
+    return gather_skipped(type) ? (v & ~kIq256Gather) : v;
+}
+
 void iq256_gu_rows(int type, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act, int nt,
                    float* const* ff, int r0, int r1) {
-    iq256_gu_rows_v(iq256_variant(), type, blob, gu_row, up_off, n, act, nt, ff, r0, r1);
+    iq256_gu_rows_v(variant_for(type), type, blob, gu_row, up_off, n, act, nt, ff, r0, r1);
 }
 
 void iq256_rows(int type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt, float* const* out,
                 int r0, int r1) {
-    iq256_rows_v(iq256_variant(), type, w, row_bytes, n, act, nt, out, r0, r1);
+    iq256_rows_v(variant_for(type), type, w, row_bytes, n, act, nt, out, r0, r1);
 }
 
 void iq4nl256_down_rows_v(int variant, const uint8_t* w, size_t row_bytes, int n, const void* const* hq, int nt,
