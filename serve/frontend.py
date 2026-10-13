@@ -370,6 +370,42 @@ def _env_to_user(messages: list[dict]) -> list[dict]:
     return messages
 
 
+# local (config "skills_compact", opt-in): opencode lists every installed skill in the system message with its whole
+# description and file location (58 skills, ~32K characters, ~43% of a ~21.6K-token system message measured 2026-10-13).
+# The skill tool loads a skill by name with its full text, so the list only has to tell skills apart: each description is
+# cut to its first sentence (at most 160 characters) and the location line dropped.  A smaller prompt to read on every new
+# session and less KV cache; the model still sees every skill's name and what it is for.
+SKILLS_COMPACT = False
+_SKILL_DESC = re.compile(r"(<description>)(.*?)(</description>)", re.S)
+_SKILL_LOC = re.compile(r"[ \t]*<location>.*?</location>\n?", re.S)
+
+
+def _first_sentence(text: str, limit: int = 160) -> str:
+    t = " ".join(text.split())
+    m = re.search(r"[.!?](\s|$)", t)
+    if m and m.end() <= limit:
+        return t[:m.end()].strip()
+    return t if len(t) <= limit else t[:limit].rsplit(" ", 1)[0] + " ..."
+
+
+def _skills_compact(messages: list[dict]) -> list[dict]:
+    if not SKILLS_COMPACT or not messages or messages[0].get("role") != "system":
+        return messages
+    sys_text = messages[0].get("content")
+    if not isinstance(sys_text, str):
+        return messages
+    i = sys_text.find("<available_skills>")
+    j = sys_text.find("</available_skills>", i)
+    if i < 0 or j < 0:
+        return messages
+    block = sys_text[i:j]
+    block = _SKILL_DESC.sub(lambda m: m.group(1) + _first_sentence(m.group(2)) + m.group(3), block)
+    block = _SKILL_LOC.sub("", block)
+    out = list(messages)
+    out[0] = dict(messages[0], content=sys_text[:i] + block + sys_text[j:])
+    return out
+
+
 # local (config "tool_hints", opt-in): a short, fixed note at the end of the system message of every request that declares
 # tools, for any harness (opencode, DeepSeek Harness, ...).  The model used one tool call per turn even for independent
 # reads, listed empty folders and opened task lists for one-file jobs; every extra turn is a prompt read plus a new answer.
@@ -397,6 +433,14 @@ TOOL_HINT_RULES = {
                 "different method.",
     "keep_tests": "Never change a test's expected values or remove tests to make your code pass; check the expected value "
                   "independently first and change it only when it is provably wrong.",
+    # 2026-10-13: redundant verification is the costliest agent pattern (arXiv 2608.01347: ~18x cost, same success); our
+    # model drafted whole files in its reasoning before writing them, and spent 7 min clicking through a GUI it had built
+    "verify_once": "Verify a result once: when a test or check passes, stop - do not re-run or re-check what already passed.",
+    "no_think_draft": "Do not write out whole files or long code in your reasoning; plan briefly, then write the code directly "
+                      "with the write or edit tool.",
+    "gui_check": "For a desktop or GUI program: build it, start it once and take one screenshot to check it; do not automate "
+                 "clicks or test every feature unless asked.",
+    "web_research": "For a question that needs information from the internet, call web_research once with 2-4 queries (it searches the web, Wikipedia, papers, code and forums at the same time and reads the best pages in parallel) instead of several web_search / web_fetch calls; in OpenCode it is tools[\"qwen-web\"].web_research inside execute.",
 }
 
 
@@ -624,7 +668,7 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
             kwargs = {"enable_thinking": False}
         elif k == "reasoning_effort" and "enable_thinking" not in kwargs:
             kwargs.update(effort_kwargs(v))
-    return _tool_hints(_lsp_filter(_env_to_user(_late_system_to_user(messages))), tools), tools, kwargs
+    return _tool_hints(_lsp_filter(_env_to_user(_skills_compact(_late_system_to_user(messages)))), tools), tools, kwargs
 
 
 BILLING_HEADER = "x-anthropic-billing-header:"
@@ -720,7 +764,7 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
         # A config's reasoning_effort still applies: Service.with_shared sets output_config before this runs.  A
         # request that gives its own reasoning_budget_tokens (#123) asks for thinking, so it thinks as before.
         kwargs["enable_thinking"] = False
-    return _tool_hints(_lsp_filter(_env_to_user(_late_system_to_user(messages))), tools), tools, kwargs
+    return _tool_hints(_lsp_filter(_env_to_user(_skills_compact(_late_system_to_user(messages)))), tools), tools, kwargs
 
 
 # ------------------------------------------------------------------------------------------------ output parser

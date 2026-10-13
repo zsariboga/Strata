@@ -6776,6 +6776,10 @@ def main() -> int:
     if unknown:
         raise SystemExit(f"[strata] config \"tool_hints\": unknown rule(s) {unknown}; known: {list(_frontend.TOOL_HINT_RULES)}")
     _frontend.set_tool_hints(th)
+    sc = cfg.get("skills_compact", False)              # local opt-in: see frontend._skills_compact
+    if not isinstance(sc, bool):
+        raise SystemExit(f"[strata] config \"skills_compact\" must be true or false, not {sc!r}")
+    _frontend.SKILLS_COMPACT = sc
     lf = cfg.get("lsp_filter", False)                  # local opt-in: see frontend._lsp_filter
     if not isinstance(lf, bool):
         raise SystemExit(f"[strata] config \"lsp_filter\" must be true or false, not {lf!r}")
