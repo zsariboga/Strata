@@ -5112,11 +5112,19 @@ int main(int argc, char** argv) {
         const char* sk = std::getenv("STRATA_CPU_REPACK_SKIP");
         const size_t skip = sk ? (size_t) std::max(0LL, std::atoll(sk)) : 3000;
         const uint64_t budget = (uint64_t) std::atoll(rm) << 20;
+        std::vector<std::pair<int32_t, int32_t>> rp_prof;
+        const std::vector<std::pair<int32_t, int32_t>>* order = &profile;
+        if (const char* pp = std::getenv("STRATA_CPU_REPACK_PROFILE"); pp != nullptr && *pp) {
+            int64_t ps = 0;
+            std::string perr;
+            if (strata::core::read_expert_profile(pp, g.n_layers, g.n_expert, rp_prof, ps, perr)) order = &rp_prof;
+            else std::fprintf(stderr, "strata generate: STRATA_CPU_REPACK_PROFILE: %s\n", perr.c_str());
+        }
         std::vector<std::pair<int32_t, int32_t>> pick;
         std::vector<uint64_t> at;
         uint64_t used = 0;
-        for (size_t r = skip; r < profile.size() && lay.native; ++r) {
-            const int32_t l = profile[r].first, e = profile[r].second;
+        for (size_t r = skip; r < order->size() && lay.native; ++r) {
+            const int32_t l = (*order)[r].first, e = (*order)[r].second;
             if (l < 0 || l >= (int32_t) lay.fmt.size()) continue;
             const auto& f = lay.fmt[(size_t) l];
             if (!strata::kernels::cpu::iq256_repack_supported(f.gu_type) || f.gu_type == 16 || f.n_embd % 256 != 0) continue;

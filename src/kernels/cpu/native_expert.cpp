@@ -14,6 +14,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <atomic>
 #include <cstdlib>
 #include <mutex>
 
@@ -154,6 +155,28 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
     }();
     // local STRATA_CPU_REPACK_MIB: this expert's repacked copy, taken exactly where the original kernels below would run
     // (the exact one-token rows, or the AVX-2 rows); the same bits (iq_avx2.hpp).  Anything else: the original paths.
+    static const bool rp_stats = std::getenv("STRATA_CPU_REPACK_STATS") != nullptr;
+    if (rp_stats) {   // local: how many gate/up calls (by token count) found a repacked copy
+        static std::atomic<uint64_t> calls[9], hits[9], printed{0};
+        const int k = nt < 8 ? nt : 8;
+        calls[k].fetch_add(1, std::memory_order_relaxed);
+        if (cpu_repack_find(blob) != nullptr) hits[k].fetch_add(1, std::memory_order_relaxed);
+        uint64_t total = 0;
+        for (int i = 1; i <= 8; ++i) total += calls[i].load(std::memory_order_relaxed);
+        if (total / 200000 > printed.load(std::memory_order_relaxed)) {
+            printed.store(total / 200000);
+            uint64_t h = 0;
+            char buf[256];
+            int o = 0;
+            for (int i = 1; i <= 8; ++i) {
+                h += hits[i].load();
+                o += std::snprintf(buf + o, sizeof buf - (size_t) o, " %d:%llu/%llu", i, (unsigned long long) hits[i].load(),
+                                   (unsigned long long) calls[i].load());
+            }
+            std::fprintf(stderr, "strata: CPU repack: %llu of %llu gate/up calls repacked (%.1f%%); by tokens%s\n",
+                         (unsigned long long) h, (unsigned long long) total, 100.0 * (double) h / (double) total, buf);
+        }
+    }
     if (avx2 && !cpu_avx512_ok()) {
         if (const uint8_t* rp = cpu_repack_find(blob)) {
             if (exact_one && nt == 1 && (f.gu_type == 16 || f.gu_type == 17 || f.gu_type == 18 || f.gu_type == 21)) {
