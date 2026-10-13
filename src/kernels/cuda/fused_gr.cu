@@ -1472,8 +1472,10 @@ __device__ __forceinline__ float4 q8_four(uint32_t q, float d) {
                        d * (float) (int8_t) ((q >> 16) & 255u), d * (float) (int8_t) (q >> 24));
 }
 
-template <int T>
-__global__ void __launch_bounds__(THREADS) gr_down_q8_kernel(GrMulti m, float* __restrict__ part, float* __restrict__ ssg) {
+// local STRATA_HCQ8_MINB=2|3: the same kernel compiled for 2 / 3 resident blocks per SM (fewer registers; 156 at 1 left one
+// block of 8 warps per SM on an RTX 5070 Ti Laptop, 176 blocks in 3.8 waves).  Same arithmetic, so bitwise the same.
+template <int T, int MINB = 1>
+__global__ void __launch_bounds__(THREADS, MINB) gr_down_q8_kernel(GrMulti m, float* __restrict__ part, float* __restrict__ ssg) {
     __shared__ __align__(16) float xs[T][Q8_KC];
     __shared__ float red[WARPS][T];
     const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
@@ -1893,9 +1895,18 @@ template <int T> void launch_q8_t(const GrMulti& m, float* part, float* ssg, cud
     static const bool ts = [] { const char* v = std::getenv("STRATA_TSUM"); return v && v[0] == '1'; }();
     if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0, (void*) st);
     if (ts) gr_down_q8_fast_kernel<T, 4><<<dim3(LR / (WARPS * 4) + 1, Q8_NKC), THREADS, 0, st>>>(m, part, ssg);
-    else gr_down_q8_kernel<T><<<dim3(Q8_RG + 1, Q8_NKC), THREADS, 0, st>>>(m, part, ssg);
+    else {
+        static const int minb = [] { const char* v = std::getenv("STRATA_HCQ8_MINB"); return v ? std::atoi(v) : 1; }();
+        if (minb == 3) gr_down_q8_kernel<T, 3><<<dim3(Q8_RG + 1, Q8_NKC), THREADS, 0, st>>>(m, part, ssg);
+        else if (minb == 2) gr_down_q8_kernel<T, 2><<<dim3(Q8_RG + 1, Q8_NKC), THREADS, 0, st>>>(m, part, ssg);
+        else gr_down_q8_kernel<T><<<dim3(Q8_RG + 1, Q8_NKC), THREADS, 0, st>>>(m, part, ssg);
+    }
     if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0 + 1, (void*) st);
-    if (ts) gr_up_q8_fast_kernel<T, false><<<UPM_BLOCKS, THREADS, 0, st>>>(m, part, ssg);
+    // local STRATA_HCQ8_UPPF=1: the fast up kernel's PF variant (every row's weights in registers before the part / lo phase;
+    // off on gfx1151 at 0.92-1.03x, unmeasured on CUDA)
+    static const bool uppf = [] { const char* v = std::getenv("STRATA_HCQ8_UPPF"); return v && v[0] == '1'; }();
+    if (ts && uppf) gr_up_q8_fast_kernel<T, true><<<UPM_BLOCKS, THREADS, 0, st>>>(m, part, ssg);
+    else if (ts) gr_up_q8_fast_kernel<T, false><<<UPM_BLOCKS, THREADS, 0, st>>>(m, part, ssg);
     else gr_up_q8_kernel<T><<<UPM_BLOCKS, THREADS, 0, st>>>(m, part, ssg);
 }
 void launch_q8(const GrMulti& m, float* scratch, cudaStream_t st, unsigned long long* stamp_buf, int stamp_i0) {

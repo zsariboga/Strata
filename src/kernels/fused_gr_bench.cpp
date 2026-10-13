@@ -122,6 +122,23 @@ int main(int argc, char** argv) {
         // the engine reads a different layer's weights every time: rotate over `cold_sets` copies (13 MB each)
         std::vector<uint16_t*> cwd(cold_sets), cwu(cold_sets), cwi(cold_sets);
         std::vector<float*> cwn(cold_sets);
+        // local STRATA_BENCH_Q8=1: the engine's STRATA_HC_Q8 read (Q8_0 down / up, BF16 inject); random int8 codes with a
+        // finite fp16 scale - the timing only depends on the sizes and the access pattern
+        const bool q8 = std::getenv("STRATA_BENCH_Q8") != nullptr;
+        std::vector<uint8_t*> cqd(cold_sets, nullptr), cqu(cold_sets, nullptr);
+        if (q8) {
+            const size_t qbytes = (size_t) LR * (D / 32) * 34;   // [LR][D] and [D][LR] both LR * D / 32 blocks
+            std::vector<uint8_t> qh(qbytes);
+            for (size_t b = 0; b < qbytes; b += 34) {
+                qh[b] = 0x1f; qh[b + 1] = 0x20;                   // fp16 ~0.0079
+                for (int j = 2; j < 34; ++j) qh[b + j] = (uint8_t) (rng() & 0xff);
+            }
+            for (int c = 0; c < cold_sets; ++c) {
+                cudaMalloc((void**) &cqd[c], qbytes); cudaMemcpy(cqd[c], qh.data(), qbytes, cudaMemcpyHostToDevice);
+                cudaMalloc((void**) &cqu[c], qbytes); cudaMemcpy(cqu[c], qh.data(), qbytes, cudaMemcpyHostToDevice);
+            }
+            std::printf("STRATA_BENCH_Q8: Q8_0 down/up (%.2f MB each)\n", qbytes / 1e6);
+        }
         for (int c = 0; c < cold_sets; ++c) {
             cudaMalloc((void**) &cwd[c], wd.size() * 2); cudaMemcpy(cwd[c], wd.data(), wd.size() * 2, cudaMemcpyHostToDevice);
             cudaMalloc((void**) &cwu[c], wu.size() * 2); cudaMemcpy(cwu[c], wu.data(), wu.size() * 2, cudaMemcpyHostToDevice);
@@ -141,6 +158,7 @@ int main(int argc, char** argv) {
                     a.R = dR + (size_t) t * D; a.R_out = dR + (size_t) t * D; a.apply = 1;
                     a.bo_prev = dbo + (size_t) t * N; a.inj_prev = dinj + (size_t) t * HC;
                     a.w_norm = cwn[c]; a.w_down = cwd[c]; a.w_up = cwu[c]; a.w_inject = cwi[c];
+                    if (q8) { a.q8_down = cqd[c]; a.q8_up = cqu[c]; }
                     a.lo = dlo + (size_t) t * LR; a.rs = drs + (size_t) t * HC;
                     a.inject_out = dio + (size_t) t * HC; a.mixed = dmix + (size_t) t * N;
                 }
@@ -166,6 +184,20 @@ int main(int argc, char** argv) {
                 n_.push_back((double) (p[1] - p[0])); d_.push_back((double) (p[2] - p[1])); u_.push_back((double) (p[3] - p[2]));
             }
             auto med = [](std::vector<double>& v) { std::sort(v.begin(), v.end()); return v[v.size() / 2] / 1e3; };
+            if (q8) {   // local: the read's outputs for set 0 (compare STRATA_HCQ8_* variants bit for bit)
+                cudaMemcpy(dR, R.data(), R.size() * 4, cudaMemcpyHostToDevice);
+                K::fused_gr_read_multi(&as[0], T, dxn, s);
+                cudaStreamSynchronize(s);
+                std::vector<float> o((size_t) TM * (D + LR + HC + N));
+                float* p = o.data();
+                cudaMemcpy(p, dR, (size_t) TM * D * 4, cudaMemcpyDeviceToHost); p += (size_t) TM * D;
+                cudaMemcpy(p, dlo, (size_t) TM * LR * 4, cudaMemcpyDeviceToHost); p += (size_t) TM * LR;
+                cudaMemcpy(p, drs, (size_t) TM * HC * 4, cudaMemcpyDeviceToHost); p += (size_t) TM * HC;
+                cudaMemcpy(p, dmix, (size_t) TM * N * 4, cudaMemcpyDeviceToHost);
+                unsigned long long hq = 1469598103934665603ull;
+                for (size_t b = 0; b < o.size() * 4; ++b) hq = (hq ^ ((const unsigned char*) o.data())[b]) * 1099511628211ull;
+                std::printf("Q8 T %d fast %d output hash %016llx\n", T, f, hq);
+            }
             std::printf("COLD(%d sets) fast %d T %d | read %6.1f us (events) | stamps median: norm %5.1f down %5.1f up %5.1f us (incl. a stamp kernel each)\n",
                         cold_sets, f, T, 1e3 * ms / iters, med(n_), med(d_), med(u_));
         }
