@@ -74,4 +74,11 @@ void fused_gr_set_fast(int on);
 void fused_gr_check();
 int fused_gr_variant();
 
+/// local STRATA_HC_Q8_PERSIST=1 (CUDA): the STRATA_HC_Q8 multi read as one persistent kernel (80 resident blocks, the down
+/// projection split by column slices, two grid barriers; a port of #2226's HIP read).  Another summation order (not
+/// bitwise).  `fused_gr_q8_persist_init` checks residency and the result against the default Q8_0 read once per card;
+/// `fused_gr_q8_read_persist` returns false when it did not run (off, too many tokens, not a Q8_0 read, a QFUSE read).
+void fused_gr_q8_persist_init();
+bool fused_gr_q8_read_persist(const FusedGrArgs* a, int n_tok, void* stream);
+
 }  // namespace strata::kernels

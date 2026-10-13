@@ -31,6 +31,7 @@ int main(int argc, char** argv) {
     const int iters = argc > 1 ? std::atoi(argv[1]) : 500;
     const int t_lo = argc > 2 ? std::atoi(argv[2]) : 1, t_hi = argc > 3 ? std::atoi(argv[3]) : 6;
     const int cold_sets = argc > 4 ? std::atoi(argv[4]) : 0;
+    K::fused_gr_q8_persist_init();   // local: with STRATA_HC_Q8_PERSIST=1 the Q8 reads below run persistent
     const int N = 2560, HC = 4, D = N * HC, LR = 320, TM = K::kFusedGrMaxT;
     std::mt19937 rng(7);
     std::normal_distribution<float> nd(0.f, 1.f);
@@ -165,13 +166,14 @@ int main(int argc, char** argv) {
             for (int rep = 0; rep < 2; ++rep) {
                 for (int i = 0; i < iters; ++i) {
                     K::gpu_stamp(dst, i * 4, s);
-                    K::fused_gr_read_multi(&as[(size_t) (i % cold_sets) * 8], T, dxn, s, dst, i * 4 + 1);
+                    if (!K::fused_gr_q8_read_persist(&as[(size_t) (i % cold_sets) * 8], T, s)) K::fused_gr_read_multi(&as[(size_t) (i % cold_sets) * 8], T, dxn, s, dst, i * 4 + 1);
                     K::gpu_stamp(dst, i * 4 + 3, s);
                 }
                 cudaStreamSynchronize(s);
             }
             cudaEventRecord(e0, s);
-            for (int i = 0; i < iters; ++i) K::fused_gr_read_multi(&as[(size_t) (i % cold_sets) * 8], T, dxn, s);
+            for (int i = 0; i < iters; ++i)
+                if (!K::fused_gr_q8_read_persist(&as[(size_t) (i % cold_sets) * 8], T, s)) K::fused_gr_read_multi(&as[(size_t) (i % cold_sets) * 8], T, dxn, s);
             cudaEventRecord(e1, s);
             cudaEventSynchronize(e1);
             float ms = 0;
@@ -186,7 +188,7 @@ int main(int argc, char** argv) {
             auto med = [](std::vector<double>& v) { std::sort(v.begin(), v.end()); return v[v.size() / 2] / 1e3; };
             if (q8) {   // local: the read's outputs for set 0 (compare STRATA_HCQ8_* variants bit for bit)
                 cudaMemcpy(dR, R.data(), R.size() * 4, cudaMemcpyHostToDevice);
-                K::fused_gr_read_multi(&as[0], T, dxn, s);
+                if (!K::fused_gr_q8_read_persist(&as[0], T, s)) K::fused_gr_read_multi(&as[0], T, dxn, s);
                 cudaStreamSynchronize(s);
                 std::vector<float> o((size_t) TM * (D + LR + HC + N));
                 float* p = o.data();
