@@ -12170,19 +12170,6 @@ int main(int argc, char** argv) {
                                          (long long) need_p, (long long) (p.cache->slots() - p.first));
                         first = (int32_t) (p.cache->slots() - need_p);
                     }
-                    if (need_p <= 0 || need_p + 128 > p.cache->slots()) {
-                        e = "prefill: no chunk of this request fits the slots that can be lent (#2090)";
-                        return false;
-                    }
-                    if (want_p != want)
-                        std::fprintf(stderr, "strata serve: prompt chunk %lld -> %lld tokens for this request: its "
-                                     "buffers do not fit the slots that can be lent (#2090)\n", (long long) want,
-                                     (long long) want_p);
-                    if (need_p > p.cache->slots() - p.first)   // the case that ended the engine before (#2090)
-                        std::fprintf(stderr, "strata serve: the loan for a chunk of %lld tokens (%lld slots) is larger than the "
-                                     "auto chunk's (%lld slots): starting it earlier (#2090)\n", (long long) want_p,
-                                     (long long) need_p, (long long) (p.cache->slots() - p.first));
-                    const int32_t first = (int32_t) (p.cache->slots() - need_p);
                     const int64_t stage_tok = strata::prefill::Prefill::stage_tokens();   // local STAGE_FIT
                     if (want_p != p.sp->chunk() || first != p.first_now || stage_tok != p.stage_tok_now) {
                         if (!p.sp->relayout(want_p, p.cache->device_slot(first), part_bytes(p, first), e)) return false;
