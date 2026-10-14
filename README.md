@@ -1,11 +1,12 @@
 <h1 align="center">Strata</h1>
 
-> **This fork (`laptop-12gb`):** Strata v0.1.43 tuned for a 12 GB laptop (RTX 5070 Ti Laptop, 64 GB RAM),
-> 55 → ~147 tok/s engine decode on Swift 1.5 IQ3_XXS (~117 on real opencode agent turns), vision on. The measurements, the config and the credits are in
+> **This fork (`laptop-12gb`):** Strata v0.1.44 tuned for a 12 GB laptop (RTX 5070 Ti Laptop, 64 GB RAM),
+> 55 → ~140-147 tok/s engine decode on Swift 1.5 IQ3_XXS (~117 on real opencode agent turns), vision on, plus a loop breaker
+> for long agent sessions (`STRATA_LOOP_BREAK=1`). The measurements, the config and the credits are in
 > [docs/LAPTOP_12GB_TUNING.md](docs/LAPTOP_12GB_TUNING.md). The upstream project is
 > [Niko1221/Strata](https://github.com/Niko1221/Strata).
 >
-> **Ready-made package:** [laptop-12gb v0.1.43 + MTP head v2 release](https://github.com/zsariboga/Strata/releases/tag/laptop-12gb-v0.1.43-mtp2) - the engine (RTX 30/40/50), the MTP draft head v2 and a config script: install Strata with Swift 1.5 IQ3_XXS, unpack, run `apply_laptop12gb.py`.
+> **Ready-made package (still v0.1.43, without the loop breaker):** [laptop-12gb v0.1.43 + MTP head v2 release](https://github.com/zsariboga/Strata/releases/tag/laptop-12gb-v0.1.43-mtp2) - the engine (RTX 30/40/50), the MTP draft head v2 and a config script: install Strata with Swift 1.5 IQ3_XXS, unpack, run `apply_laptop12gb.py`.
 
 **English** · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [Deutsch](README.de.md) · [Français](README.fr.md) · [Español](README.es.md) · [Português](README.pt-BR.md)
 

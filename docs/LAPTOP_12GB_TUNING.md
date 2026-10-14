@@ -1,8 +1,8 @@
 # Tuning Strata on a 12 GB laptop: 55 → 147 tok/s
 
 This fork's `laptop-12gb` branch is the exact engine and server I run every day on a gaming laptop. It is Strata
-v0.1.43 plus some community PRs that are not merged upstream, plus a few local changes. Everything here was measured
-on one machine over nine days (4–12 October 2026). The later work is in "Since 0.1.40.1", "Since 0.1.40.3", "Since 0.1.41" and "12 October: MTP head v2" below. Most of the local changes are opt-in switches, and with them off
+v0.1.44 plus some community PRs that are not merged upstream, plus a few local changes. Everything here was measured
+on one machine over eleven days (4–14 October 2026). The later work is in "Since 0.1.40.1", "Since 0.1.40.3", "Since 0.1.41", "12 October: MTP head v2" and "13–14 October: v0.1.44, a loop breaker" below. Most of the local changes are opt-in switches, and with them off
 the engine behaves like the code it sits on.
 
 ![55 → 145 tok/s on a 12 GB laptop](img/laptop-12gb-55-145.png)
@@ -505,6 +505,56 @@ questions and −1.6% / −5.8% on Turkish / coding answers (both mirrored pairs
 when its CPU expert misses cost more than its expected token (after "The Limits of Speculation", arXiv 2609.22156) gave
 a ceiling of 0.1-0.2% and was dropped.
 
+## 13–14 October: v0.1.44, a loop breaker
+
+v0.1.44 is merged in with every local change kept (14 files had conflicts; the local on-demand image encoder and
+upstream's elastic one sit side by side in the server). Speed is the same as 0.1.43.1 here: in a mirrored run
+(old/new/new/old) the engine was 7.486 / 7.527 → 7.406 / 7.429 ms/token, but a controlled run after a reboot gave
+0.1.43.1 142.4 tok/s (30 questions) / 120.5 (coding) / 7.50 ms/token against 0.1.44 140.7 / 124.9 / 7.46, so I count
+it as no change. 0.1.44.1 only fixes other platforms (its answers are byte-identical to 0.1.44), so it is not merged.
+
+**Loops.** A scan of my opencode history (4.06M generated tokens) found a hard loop in 11% of the sessions longer than
+3K tokens, and 5.7% of all tokens were repeats. The old guards only caught patterns of up to 16 tokens; real loops
+repeat whole paragraphs, and the thinking wrap-up could carry a looping paragraph into the answer (29K tokens in one
+case). The local loop breaker, `STRATA_LOOP_BREAK=1`:
+
+- the engine's loop guard now looks at periods of up to 512 tokens (CAR and lossy acceptance are off while it fires);
+- after 3 copies of a span of 256 tokens or more, the engine enters a 1024-token break mode: in each verify window the
+  token that would continue the earlier copy gets −100 at row 0 (the bans now also apply in `sample_tokens_spec`,
+  which they did not before);
+- the server stops an answer that repeats a 17-512 token span 3 times outside the thinking
+  (`"pattern_stop_long_tokens": 4096` in the config).
+
+Replayed over the history it fired 96 times, all on real loops, with no false alarm. In the live server it has fired
+on long agent sessions, each time for 1-7 windows. The agent tasks' A/B did not produce a hard loop in
+either arm, so its speed effect is not measured; with no loop it changes nothing.
+
+**Server:** `"skills_compact": true` (local) cuts opencode's skill list to each skill's first sentence and drops the
+location lines: the system turn goes from 21.6K to 16.3K tokens (~3 s less on a new session's first read). Merged PRs:
+#2371 (XML tool arguments converted by the schema's type: integers, numbers, booleans, null; it covers the local
+`True`/`False` fix), #2397 (`response_format` JSON together with tools), #2352 (an explicit `reasoning_effort: false`
+is not replaced by a configured default). #2358 (`STRATA_GR_NORM_FAST=1` on CUDA) is merged as an opt-in but does
+nothing here: with `STRATA_HC_Q8=1` the hyper-connection read never calls the split norm kernel it speeds up.
+
+Measured and **rejected** (opt-in code, off by default):
+
+| idea | result |
+|---|---|
+| `STRATA_PIN_BY_NEED=1` (new in 0.1.44) | agent set 8.506 → 9.293 ms/token, 9% slower |
+| KTransformers-style expert deferral (`STRATA_EXPERT_DEFER=1`, local prototype: CPU rows added one layer late) | window −3.5%, accepted tokens per window −3.7%: neutral |
+| Q8 hyper-connection read variants: 2-3 blocks per SM (`STRATA_HCQ8_MINB`), a Q8 port of #2226's persistent read (`STRATA_HC_Q8_PERSIST`), `SPLITUP`, `PAIRUP` | none beat the default kernel (one block per SM, 155 registers) |
+| 30+ existing lossless switches (#2223 `STRATA_NO_PCIE_GROUP`, `Q2_BITPLANE`, `TSUM`, `DF_PDL` / `DF_BRANCH` / `DF_PLE`, `EXP_MODE` 5-8, `SH_STREAM`, `--adapt-min-gain 3`, `--lookup-chain 4`) | no gain over the live configuration |
+| `STRATA_POOL_SPIN_US=0` or 14 pool workers with two busy desktop cores | two busy cores cost +6% ms/token (all in the CPU phase); `SPIN_US=0` gave nothing, 14 workers +16% (worse) |
+
+The kernels on this card are already tuned for sm_120: the verify window is ~21 ms of GPU chain, and the remaining
+gains here are in drafting (MTP) and in the lossy rules, not in kernel switches.
+
+**Long sessions and RAM.** On a 64 GB machine the engine commits ~59 GB at ~136K tokens of context. With other
+programs open, Windows then pages part of it out and decode stalls for up to ~20 s at a time (2-5 tok/s, page reads up
+to ~5,000/s), while the GPU shows no throttling. Two things help: compact the conversation earlier (Hermes:
+`compression.threshold` below 0.5 of a 262K context), and do not let MCP servers pile up (one opencode server here held
+333 stale MCP processes, ~15 GB committed).
+
 ## Reproducing
 
 1. Build this branch the normal way (CUDA 13, sm_120 here) and point the config's `exe` at the build.
@@ -525,5 +575,6 @@ much of the model fits in VRAM and how fast your CPU and PCIe are.
 Strata is by Niko1221 and its contributors. The parts on this branch that are not mine come from:
 konijiwa110 (#960), dhoard (#1017, CAR), Breno Perucchi (#1107), Hardin22 (the #1166 host-core idea),
 imanu86 (the HC kernels, imanu86/Strata-2080Ti), sergiywith (#1367, #1368, #1370, #1379), InB4DevOps (#1415),
-Ron Forrester (#1430) and W1nge (#1455). `STRATA_ATTN_LANECELL` is an opt-in switch that already exists
+Ron Forrester (#1430), W1nge (#1455), Rafa (#2223), anstaendig (#2371), Jussi Hallila (#2397), Tsury (#2352)
+and Warabii1248 (#2358). `STRATA_ATTN_LANECELL` is an opt-in switch that already exists
 in 0.1.40's QSA attention kernel.
