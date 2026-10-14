@@ -486,6 +486,11 @@ TOOL_HINT_RULES = {
                       "with the write or edit tool.",
     "gui_check": "For a desktop or GUI program: build it, start it once and take one screenshot to check it; do not automate "
                  "clicks or test every feature unless asked.",
+    "gui_tools": "To run or check a desktop GUI program, call the pencere tools inside execute: "
+                 "tools.pencere.app_start({path}) starts it in the background and returns its screenshot and controls; "
+                 "then click / set_text / send_keys / window_shot, and close it with app_close when the check is done. Never move the real mouse (SetCursorPos, "
+                 "mouse_event), never copy the screen (CopyFromScreen) and never start a GUI program in the foreground of "
+                 "a shell command (the command waits until the program closes).",
     "web_research": "For a question that needs information from the internet, call web_research once with 2-4 queries (it searches the web, Wikipedia, papers, code and forums at the same time and reads the best pages in parallel) instead of several web_search / web_fetch calls; in OpenCode it is tools[\"qwen-web\"].web_research inside execute.",
 }
 

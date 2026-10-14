@@ -57,6 +57,9 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
 // local (STRATA_THINK_BAN): every later `sample_tokens` over a `vocab`-wide row first adds `*d_bias` (a device-
 // visible float, mapped host memory; 0 = off) to the logits of the `n` ids at `d_ids` (device memory).
 void set_logit_ban(const int32_t* d_ids, int n, int vocab, const float* d_bias);
+// local (STRATA_LOOP_BREAK): every later sample over a `vocab`-wide row set adds `*d_bias` (mapped; 0 = off) to the
+// logit of the id at `*d_id` (mapped; -1 = none) in the FIRST row only.
+void set_loop_ban(const int32_t* d_id, int vocab, const float* d_bias);
 
 // The greedy pick (no penalties) on a thread-block cluster of 8 CTAs per row (sm_90+, CUDA; S19): the same token as
 // sample_tokens' one-block argmax, which takes it unless STRATA_ARGMAX_MULTI=0.  False (nothing launched) where it

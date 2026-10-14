@@ -150,6 +150,11 @@ REPEAT_STOP_TOKENS = 256
 # local (opt-in, the config's "pattern_stop_tokens"): a reply whose short pattern (2..16 tokens, "ÇtaÇtaÇta...")
 # repeats this many tokens in a row is ended the same way. Off by default: two alternating tokens can be content.
 PERIOD_STOP_MAX = 16
+# local (opt-in, the config's "pattern_stop_long_tokens"): the same for a long pattern (17..512 tokens: a sentence or a
+# paragraph written again and again) outside the thinking: ended once it has run this many tokens in a row AND three
+# more copies.  The thinking has reasoning_loop_recovery (a wrap-up keeps the answer); the engine's STRATA_LOOP_BREAK
+# acts first; this is the last line, a reply that keeps one paragraph cycling for tens of thousands of tokens.
+PERIOD_LONG_MAX = 512
 ANSWER_RESERVE_MIN = 512      # #984: the tokens kept for the answer when a thinking budget is cut down to fit max_tokens
 # #123: what closes the thinking when it reaches reasoning_budget_tokens (the model's own end-of-thinking tag after it)
 # #1053 (opt-in "reasoning_close_retry": true): a reply that ends on its stop token still inside <think>, with no answer
@@ -3074,6 +3079,7 @@ class Service:
         self.hide_reasoning_wrap_up = False              # local: keep the budget's wrap-up sentence out of replies
         self.repeat_stop_tokens = REPEAT_STOP_TOKENS     # #606: one token this many times in a row ends a reply (0: off)
         self.pattern_stop_tokens = 0                     # local: a 2-16 token pattern this many tokens in a row (0: off)
+        self.pattern_stop_long_tokens = 0                # local: a 17-512 token pattern this many tokens in a row (0: off)
         self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
         self.tool_call_recovery = False                   # opt-in: tool calls in forms next to the template's
         self.images = None                                # serve/images.py's ImageGen when the config has "images"
@@ -4119,6 +4125,9 @@ class Service:
         # local: the same for a short pattern (pattern_stop_tokens): run_p[p] counts the tokens in a row that equal
         # the token p before them
         run_p, period_hit = [0] * (PERIOD_STOP_MAX + 1), 0
+        # local: pattern_stop_long_tokens - long_pos[t] holds where t was in the last PERIOD_LONG_MAX tokens, run_long
+        # the runs of the periods that matched the newest token (a period missing from it has run 0)
+        long_pos, run_long, period_run = collections.defaultdict(collections.deque), {}, 0
         thinking_n = 0                                  # tokens written while thinking (Responses' reasoning_tokens)
         stop_list = stop_strings(sampling)
         stops = StopMatcher(stop_list) if stop_list else None
@@ -4294,7 +4303,25 @@ class Service:
                                         if not period_hit and run_p[p] >= self.pattern_stop_tokens:
                                             period_hit = p
                                     if period_hit:
+                                        period_run = run_p[period_hit]
                                         repeated = True     # local: a short pattern looping, as #606
+                                        break
+                                if self.pattern_stop_long_tokens and parser.state not in ("reasoning", "rcall"):
+                                    i = len(raw_ids) - 1
+                                    dq = long_pos[t]
+                                    while dq and i - dq[0] > PERIOD_LONG_MAX:
+                                        dq.popleft()
+                                    nr = {}
+                                    for j in dq:
+                                        lp = i - j
+                                        if lp > PERIOD_STOP_MAX:
+                                            r = nr[lp] = run_long.get(lp, 0) + 1
+                                            if not period_hit and r >= self.pattern_stop_long_tokens and r >= 3 * lp:
+                                                period_hit, period_run = lp, r
+                                    run_long = nr
+                                    dq.append(i)
+                                    if period_hit:
+                                        repeated = True     # local: a long pattern looping
                                         break
                                 piece = detok.push(t)
                                 tail = (tail + piece)[-2:]
@@ -4535,7 +4562,8 @@ class Service:
                     elif repeated and period_hit:
                         pat = self.tok.decode(raw_ids[-period_hit:])
                         print(f"[strata] the reply repeated a {period_hit}-token pattern ({pat!r}) "
-                              f"{run_p[period_hit]} tokens in a row: ended as \"length\" (pattern_stop_tokens in "
+                              f"{period_run} tokens in a row: ended as \"length\" (pattern_stop_tokens / "
+                              "pattern_stop_long_tokens in "
                               "strata-<model>.json; 0 or no key turns this off)", flush=True)
                     elif repeated:
                         print(f"[strata] the reply repeated one token ({self.tok.decode([run_tok])!r}) "
@@ -7028,6 +7056,10 @@ def main() -> int:
     if isinstance(ps, bool) or not isinstance(ps, int) or ps < 0:
         raise SystemExit(f"[strata] config \"pattern_stop_tokens\" must be a whole number >= 0 (0 = off), not {ps!r}")
     svc.pattern_stop_tokens = ps
+    pl = cfg.get("pattern_stop_long_tokens", 0)             # local: opt-in long-pattern loop stop (outside the thinking)
+    if isinstance(pl, bool) or not isinstance(pl, int) or pl < 0:
+        raise SystemExit(f"[strata] config \"pattern_stop_long_tokens\" must be a whole number >= 0 (0 = off), not {pl!r}")
+    svc.pattern_stop_long_tokens = pl
     svc.effort_end = bool(effort_end)                   # #458: "effort_position": "end" with an engine that has it
     if cfg.get("reasoning_budget_tokens") is not None:  # #123: a default thinking budget for every request
         try:

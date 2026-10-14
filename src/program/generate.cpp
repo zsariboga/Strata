@@ -115,6 +115,8 @@ namespace strata::metal_engine { void set_model_shard(const char* shard1); }   /
 #include <array>
 #include <chrono>
 #include <algorithm>
+#include <iterator>
+#include <unordered_map>
 #include <memory>
 #include <iostream>
 #include <functional>
@@ -180,6 +182,41 @@ void think_ban_init() {
     think_ban().bias = bias;
     std::fprintf(stderr, "strata serve: STRATA_THINK_BAN: %zu token ids get %.1f inside the thinking (vocab %d)\n",
                  ids.size(), bias, vocab);
+}
+// local (STRATA_LOOP_BREAK=1, opt-in, LOSSY only inside a loop): once the reply has repeated one span exactly three
+// times (a period of 1-512 tokens over at least STRATA_LOOP_BREAK_MIN tokens, default 256), the next STRATA_LOOP_BREAK_SPAN
+// tokens (default 1024, or until a think / call / fence edge) are written in "break mode": before each window the token
+// that would continue an earlier copy (the one after the last earlier occurrence of the reply's last 8 tokens) gets
+// STRATA_LOOP_BREAK_BIAS (default -100) in the window's first row.  A loop then has to leave its copy at once; a reply
+// that does not repeat never enters break mode and samples exactly as without it.
+struct LoopBan { int32_t* host_id = nullptr; float* host_bias = nullptr; float bias = 0.0f; };
+LoopBan& loop_ban() { static LoopBan b; return b; }
+void loop_ban_init() {
+    const char* v = std::getenv("STRATA_LOOP_BREAK");
+    if (v == nullptr || v[0] != '1' || loop_ban().host_bias != nullptr) return;
+    const char* b = std::getenv("STRATA_LOOP_BREAK_BIAS");
+    const char* vv = std::getenv("STRATA_THINK_BAN_VOCAB");
+    const float bias = b ? (float) std::atof(b) : -100.0f;
+    const int vocab = vv ? std::atoi(vv) : 248320;
+    int32_t* hid = nullptr;
+    float* hb = nullptr;
+    int32_t* d_id = nullptr;
+    float* d_bias = nullptr;
+    if (cudaHostAlloc((void**) &hid, sizeof(int32_t), cudaHostAllocMapped) != cudaSuccess ||
+        cudaHostAlloc((void**) &hb, sizeof(float), cudaHostAllocMapped) != cudaSuccess ||
+        cudaHostGetDevicePointer((void**) &d_id, hid, 0) != cudaSuccess ||
+        cudaHostGetDevicePointer((void**) &d_bias, hb, 0) != cudaSuccess) {
+        std::fprintf(stderr, "strata serve: STRATA_LOOP_BREAK could not be set up; off\n");
+        return;
+    }
+    *(volatile int32_t*) hid = -1;
+    *(volatile float*) hb = 0.0f;
+    strata::kernels::set_loop_ban(d_id, vocab, d_bias);
+    loop_ban().host_id = hid;
+    loop_ban().host_bias = hb;
+    loop_ban().bias = bias;
+    std::fprintf(stderr, "strata serve: STRATA_LOOP_BREAK: a reply that repeats one span three times gets %.1f on the "
+                         "token continuing its copy (vocab %d)\n", bias, vocab);
 }
 // local fixes for STRATA_ROUTE_PRIOR (see route_prior.cu): STRATA_ROUTE_PRIOR_SCOPE = answer | think | all puts the
 // bonus behind the same structure gate as CAR (never inside <tool_call> or a ``` fence, nor in a window whose drafts
@@ -8355,6 +8392,7 @@ int main(int argc, char** argv) {
         ver.set_remote_expert_opt(remote_opt.get());
         set_car_on(ver);
         think_ban_init();
+        loop_ban_init();
         prior_gate_init();
         if (batch_mtp) ver.set_batch_graph_limit(64);   // --batch-mtp only: slot rotation makes many layouts (LRU); 0.1.39 keeps all
         if (!ver.init(wt, g, ss, vh, native_head.loaded() || prefill_head_alias_bound ? &native_head : nullptr,
@@ -12538,41 +12576,94 @@ int main(int argc, char** argv) {
                 const char* a = std::getenv("STRATA_TYPICAL_ANSWER");
                 return a != nullptr && a[0] == '1';
             }();
-            // local loop guard (STRATA_LOOP_GUARD=0 turns it off): while the last 48 tokens repeat a pattern of 1-16
-            // tokens, the lossy rules (STRATA_TYPICAL margin, CAR) are off.  A margin rule keeps a draft whose
-            // probability is a fair share of the top's, so a loop token with p = 0.4 against an exit with p = 0.6
-            // is kept every time and the loop can never end; exact sampling leaves it at the model's own rate.
+            // local loop guard (STRATA_LOOP_GUARD=0 turns it off): while the reply's last max(48, p) tokens repeat a
+            // pattern of p = 1..STRATA_LOOP_GUARD_PMAX tokens (default 512; 16 was the first version's reach, which a
+            // loop of whole sentences or paragraphs never met), the lossy rules (STRATA_TYPICAL margin, CAR, the route
+            // prior) are off.  A margin rule keeps a draft whose probability is a fair share of the top's, so a loop
+            // token with p = 0.4 against an exit with p = 0.6 is kept every time and the loop can never end; exact
+            // sampling leaves it at the model's own rate.  run[p] counts the tokens in a row equal to the one p
+            // before them, so a look costs one compare per period.
             static const bool loop_guard = [] {
                 const char* v = std::getenv("STRATA_LOOP_GUARD");
                 return v == nullptr || v[0] != '0';
             }();
+            static const int loop_pmax = [] {
+                const char* v = std::getenv("STRATA_LOOP_GUARD_PMAX");
+                const int x = v ? std::atoi(v) : 512;
+                return x < 1 ? 1 : x > 512 ? 512 : x;
+            }();
+            static const int64_t brk_min = [] {
+                const char* v = std::getenv("STRATA_LOOP_BREAK_MIN");
+                return (int64_t) (v ? std::max(32, std::atoi(v)) : 256);
+            }();
+            static const int64_t brk_span = [] {
+                const char* v = std::getenv("STRATA_LOOP_BREAK_SPAN");
+                return (int64_t) (v ? std::max(16, std::atoi(v)) : 1024);
+            }();
             struct TypState {
-                bool think = false, tool = false, fence = false, loop = false;
-                int64_t loop_tokens = 0, loop_spans = 0;
-                int32_t last[64] = {};
+                enum { kH = 1024, kW = 48, kG = 8 };   // a local class has no static data members
+                bool think = false, tool = false, fence = false, loop = false, track = false;
+                int64_t loop_tokens = 0, loop_spans = 0, brk_spans = 0, brk_bans = 0, brk_left = 0;
+                int32_t last[kH] = {};
+                int32_t run[513] = {};
                 int64_t seen = 0;
+                std::vector<int32_t> reply;                       // the reply so far (break mode looks back in it)
+                std::unordered_map<uint64_t, int64_t> grams;      // hash of 8 tokens -> where they last ended
+                static uint64_t gram_hash(const int32_t* g) {
+                    uint64_t h = 1469598103934665603ull;
+                    for (int i = 0; i < kG; ++i) h = (h ^ (uint32_t) g[i]) * 1099511628211ull;
+                    return h;
+                }
                 void feed(int64_t id) {
+                    const bool edge = id == 248068 || id == 248069 || id == 248058 || id == 248059 ||
+                                      ((id == 71093 || id == 52451) && !tool);
                     if (id == 248068) { think = true; fence = false; }
                     else if (id == 248069) { think = false; fence = false; }
                     else if (id == 248058) tool = true;
                     else if (id == 248059) tool = false;
                     else if ((id == 71093 || id == 52451) && !tool) fence = !fence;
-                    if (!loop_guard) return;
-                    last[seen & 63] = (int32_t) id;
-                    ++seen;
-                    constexpr int kW = 48, kP = 16;
-                    bool rep = false;
-                    if (seen >= kW + kP)
-                        for (int p = 1; p <= kP && !rep; ++p) {
+                    if (!loop_guard || !track) return;
+                    if (edge) brk_left = 0;                       // break mode stays inside the span it began in
+                    const int maxp = (int) std::min<int64_t>(seen, loop_pmax);
+                    bool rep = false, brk = false;
+                    for (int p = 1; p <= maxp; ++p) {
+                        const int32_t r = last[(seen - p) & (kH - 1)] == (int32_t) id ? run[p] + 1 : 0;
+                        run[p] = r;
+                        if (r >= kW && r >= p) {
                             rep = true;
-                            for (int i = 0; i < kW && rep; ++i)
-                                rep = last[(seen - 1 - i) & 63] == last[(seen - 1 - i - p) & 63];
+                            if (r >= 2 * p && r >= brk_min) brk = true;   // three copies, enough of them
                         }
+                    }
+                    last[seen & (kH - 1)] = (int32_t) id;
+                    ++seen;
+                    reply.push_back((int32_t) id);
+                    // the 8 tokens that ended one before this one: lagged, so a lookup of the newest 8 finds an
+                    // EARLIER copy and never itself
+                    if (seen > kG) grams[gram_hash(&reply[(size_t) (seen - 1 - kG)])] = seen - 2;
+                    if (brk) {
+                        if (brk_left == 0 && loop_ban().host_bias != nullptr) ++brk_spans;
+                        if (loop_ban().host_bias != nullptr) brk_left = brk_span;
+                    } else if (brk_left > 0) {
+                        --brk_left;
+                    }
                     if (rep && !loop) ++loop_spans;
-                    loop = rep;
-                    loop_tokens += rep;
+                    loop = rep || brk_left > 0;
+                    loop_tokens += loop;
                 }
-                void reset_history() { seen = 0; loop = false; }
+                // the token an earlier copy went on with after the reply's last 8 tokens (-1: none, or not in
+                // break mode)
+                int32_t next_ban() const {
+                    if (brk_left <= 0 || seen <= kG) return -1;
+                    const auto it = grams.find(gram_hash(&reply[(size_t) (seen - kG)]));
+                    if (it == grams.end()) return -1;
+                    const int64_t e = it->second;
+                    return e + 1 < seen ? reply[(size_t) (e + 1)] : -1;
+                }
+                void reset_history() {
+                    seen = 0; loop = false; track = true; brk_left = 0; reply.clear(); grams.clear();
+                    std::fill(std::begin(run), std::end(run), 0);
+                    if (loop_ban().host_bias != nullptr) *(volatile float*) loop_ban().host_bias = 0.0f;   // no stale ban
+                }
                 bool lossy(bool answer) const { return !loop && (answer ? !tool && !fence : think); }
             } typ_st;
             {
@@ -13397,6 +13488,13 @@ int main(int argc, char** argv) {
                     if (think_ban().host != nullptr)
                         *(volatile float*) think_ban().host =
                             (typ_st.think && !typ_st.tool && !typ_st.loop) ? think_ban().bias : 0.0f;
+                    // local (STRATA_LOOP_BREAK): in break mode the next position may not continue an earlier copy
+                    if (loop_ban().host_bias != nullptr) {
+                        const int32_t bid = typ_st.next_ban();
+                        *(volatile int32_t*) loop_ban().host_id = bid;
+                        *(volatile float*) loop_ban().host_bias = bid >= 0 ? loop_ban().bias : 0.0f;
+                        typ_st.brk_bans += bid >= 0;
+                    }
                 }
                 if (!ver.run(T, window.data(), p, win_pool_fn, win_pool_user, outv.data(), err) || drive.d.failed) {
                     std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
@@ -13892,6 +13990,10 @@ int main(int argc, char** argv) {
             if (typ_st.loop_spans > 0)
                 std::fprintf(stderr, "strata serve: loop guard: %lld repeating spans, %lld tokens without the lossy rules\n",
                              (long long) typ_st.loop_spans, (long long) typ_st.loop_tokens);
+            if (typ_st.brk_spans > 0)
+                std::fprintf(stderr, "strata serve: loop break: %lld loops broken, %lld windows with a banned copy token\n",
+                             (long long) typ_st.brk_spans, (long long) typ_st.brk_bans);
+            if (loop_ban().host_bias != nullptr) *(volatile float*) loop_ban().host_bias = 0.0f;
             if (sfx_windows > 0)
                 std::fprintf(stderr, "strata serve: suffix drafts: %lld windows, %lld of %lld drafts accepted\n",
                              (long long) sfx_windows, (long long) sfx_ok, (long long) sfx_drafts);

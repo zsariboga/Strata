@@ -2144,6 +2144,43 @@ class PatternStop(unittest.TestCase):
         self.assertEqual(done["finish"], "stop")
 
 
+class PatternStopLong(unittest.TestCase):
+    """local: a 17-512 token pattern (a sentence written again and again) running pattern_stop_long_tokens tokens in a
+    row and three more copies ends the reply as "length"; off by default (0)."""
+
+    def run_reply(self, script, limit):
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, script, max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        svc.pattern_stop_long_tokens = limit
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            done = [x for kind, x in svc.run(tok.encode("hi"), False, None, 20000, {}, threading.Event())
+                    if kind == "done"][0]
+        return done, out.getvalue()
+
+    def test_a_looping_sentence_is_ended(self):
+        sent = "Yani plus = split node s, ama b ilk seferde olmamali. "      # 55 tokens with the byte tokenizer
+        done, log = self.run_reply("ok:" + sent * 200 + "never", 1024)
+        self.assertEqual(done["finish"], "length")
+        self.assertEqual(done["completion_tokens"], 3 + len(sent) + 1024)  # one copy opens it, then 1024 repeat it
+        self.assertIn(f"repeated a {len(sent)}-token pattern", log)
+
+    def test_three_copies_are_needed(self):
+        para = "".join(f"line {i} of a long paragraph that is written once\n" for i in range(12))   # ~540 > 512
+        done, _ = self.run_reply(para * 3 + "end", 64)                # a period past PERIOD_LONG_MAX: never seen
+        self.assertEqual(done["finish"], "stop")
+        sent = "a sentence of exactly forty tokens here. "
+        done, _ = self.run_reply(sent * 3 + "end", 64)                # run 80 >= 64 but under 3 x 41
+        self.assertEqual(done["finish"], "stop")
+
+    def test_off_and_differing_rows(self):
+        sent = "Yani plus = split node s, ama b ilk seferde olmamali. "
+        done, log = self.run_reply(sent * 100, 0)                     # the default: off
+        self.assertEqual(done["finish"], "stop")
+        self.assertNotIn("pattern", log)
+        done, _ = self.run_reply("".join(f"    assert f({i}) == {i * i}  # case {i}\n" for i in range(300)) + "end", 512)
+        self.assertEqual(done["finish"], "stop")
+
+
 class NonFiniteEngine(MockEngine):
     """#879: each pass ends on the engine's `DONE ... nonfinite` after plan[i] tokens (None, or no plan left: the
     script runs whole), as StrataEngine.generate raises it.  A pass that ends on it had reused all but the last
